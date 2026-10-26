@@ -13,6 +13,8 @@ use windows::Win32::System::Console::{
     GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
     ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT, ENABLE_MOUSE_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, CONSOLE_MODE,
+    ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+    ENABLE_PROCESSED_OUTPUT, DISABLE_NEWLINE_AUTO_RETURN,
 };
 use windows::core::PCWSTR;
 use shell_daemon::protocol::{self, Request, Op};
@@ -32,14 +34,14 @@ fn main() -> Result<()> {
             let name = args[2].clone();
             let wsl = args.iter().any(|a| a == "--wsl");
             let (cols, rows) = current_size();
-            let req = Request { op: Op::Start, name, wsl: Some(wsl), cols, rows };
+            let req = Request { op: Op::Start, name: name.clone(), wsl: Some(wsl), cols, rows };
             let resp = protocol::pipe_request(protocol::CONTROL_PIPE, &req)?;
             if !resp.ok {
                 eprintln!("start failed: {}", resp.error);
                 std::process::exit(1);
             }
             let (pipe_out, pipe_in) = extract_pipes(&resp.data);
-            attach(&pipe_out, &pipe_in)
+            attach(&name, &pipe_out, &pipe_in)
         }
         "continue" => {
             if args.len() < 3 {
@@ -48,14 +50,14 @@ fn main() -> Result<()> {
             }
             let name = args[2].clone();
             let (cols, rows) = current_size();
-            let req = Request { op: Op::Continue, name, wsl: None, cols, rows };
+            let req = Request { op: Op::Continue, name: name.clone(), wsl: None, cols, rows };
             let resp = protocol::pipe_request(protocol::CONTROL_PIPE, &req)?;
             if !resp.ok {
                 eprintln!("continue failed: {}", resp.error);
                 std::process::exit(1);
             }
             let (pipe_out, pipe_in) = extract_pipes(&resp.data);
-            attach(&pipe_out, &pipe_in)
+            attach(&name, &pipe_out, &pipe_in)
         }
         "list" => {
             let req = Request { op: Op::List, name: String::new(), wsl: None, cols: None, rows: None };
@@ -186,7 +188,44 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
     }
 }
 
-fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
+/// Detects the "~." detach sequence at the start of a line, like ssh.
+///
+/// A "~" typed at line start is held back until the next byte arrives, so a
+/// sequence split across two reads is still recognized.
+struct DetachDetector {
+    held_tilde: bool,
+    line_start: bool,
+}
+
+impl DetachDetector {
+    fn new() -> Self {
+        Self { held_tilde: false, line_start: true }
+    }
+
+    /// Returns the bytes to forward and whether detach was requested.
+    fn feed(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
+        let mut out = Vec::with_capacity(data.len() + 1);
+        for &b in data {
+            if self.held_tilde {
+                self.held_tilde = false;
+                if b == b'.' {
+                    return (out, true);
+                }
+                out.push(b'~');
+                self.line_start = false;
+            }
+            if self.line_start && b == b'~' {
+                self.held_tilde = true;
+                continue;
+            }
+            out.push(b);
+            self.line_start = b == b'\r' || b == b'\n';
+        }
+        (out, false)
+    }
+}
+
+fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE)? };
     let mut orig_in_mode: CONSOLE_MODE = CONSOLE_MODE(0);
@@ -211,7 +250,7 @@ fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
 
     // Print before connecting: once connected, the daemon starts streaming PTY
     // output, and mixing console-wide prints with raw byte writes garbles the line.
-    println!("\r\nattached (escape: ~.)");
+    println!("\r\nattached (detach: type ~. at the start of a line)");
 
     // Two unidirectional handles: out is read-only, in is write-only.
     // Byte-type pipes use byte read mode by default, so no SetNamedPipeHandleState
@@ -221,18 +260,36 @@ fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
 
     // Put the local console into raw mode so input passes through byte-for-byte.
     if has_console {
-        let raw_in = orig_in_mode.0
+        // Raw input, plus VT input so arrows / function keys / mouse arrive as VT
+        // sequences instead of being dropped by the console input translator.
+        // ENABLE_EXTENDED_FLAGS is required for QUICK_EDIT_MODE to take effect.
+        let raw_in = (orig_in_mode.0
+            | ENABLE_EXTENDED_FLAGS.0
+            | ENABLE_VIRTUAL_TERMINAL_INPUT.0
+            | ENABLE_MOUSE_INPUT.0)
             & !(ENABLE_LINE_INPUT.0
                 | ENABLE_ECHO_INPUT.0
                 | ENABLE_PROCESSED_INPUT.0
                 | ENABLE_WINDOW_INPUT.0
-                | ENABLE_MOUSE_INPUT.0);
-        // Enable ANSI/VT interpretation on the local console so the PTY's escape
-        // sequences are rendered, not printed as literal text.
-        let raw_out = orig_out_mode.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0;
+                | ENABLE_QUICK_EDIT_MODE.0);
+        // Processed output + VT rendering. DISABLE_NEWLINE_AUTO_RETURN makes the
+        // console treat LF like a real terminal (no implicit carriage return).
+        let raw_out = orig_out_mode.0
+            | ENABLE_PROCESSED_OUTPUT.0
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0
+            | DISABLE_NEWLINE_AUTO_RETURN.0;
         unsafe {
-            SetConsoleMode(stdin, CONSOLE_MODE(raw_in))?;
-            // VT processing is best-effort (older consoles may reject the flag).
+            if SetConsoleMode(stdin, CONSOLE_MODE(raw_in)).is_err() {
+                // VT input unsupported on this console: fall back to plain raw mode.
+                let fallback = (orig_in_mode.0 | ENABLE_EXTENDED_FLAGS.0)
+                    & !(ENABLE_LINE_INPUT.0
+                        | ENABLE_ECHO_INPUT.0
+                        | ENABLE_PROCESSED_INPUT.0
+                        | ENABLE_WINDOW_INPUT.0
+                        | ENABLE_QUICK_EDIT_MODE.0);
+                let _ = SetConsoleMode(stdin, CONSOLE_MODE(fallback));
+            }
+            // VT output is best-effort (older consoles may reject the flag).
             let _ = SetConsoleMode(stdout, CONSOLE_MODE(raw_out));
         }
     }
@@ -268,6 +325,32 @@ fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
         out_cp: orig_out_cp,
     };
 
+    // Keep the hosted PTY in sync with the local console size: TUI apps need the
+    // resize event, and it is only reported to us as a changed console window size.
+    if has_console {
+        let resize_name = name.to_string();
+        std::thread::spawn(move || {
+            let mut last = current_size();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let cur = current_size();
+                if cur == last || cur.0.is_none() || cur.1.is_none() {
+                    continue;
+                }
+                last = cur;
+                let req = Request {
+                    op: Op::Resize,
+                    name: resize_name.clone(),
+                    wsl: None,
+                    cols: cur.0,
+                    rows: cur.1,
+                };
+                // Failures are non-fatal: the session may be gone already.
+                let _ = protocol::pipe_request(protocol::CONTROL_PIPE, &req);
+            }
+        });
+    }
+
     // The main thread will block reading the out pipe. Remember its id so the
     // stdin thread can cancel that read when the user detaches with "~.".
     let main_tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
@@ -275,6 +358,7 @@ fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
     let stdin_thread = std::thread::spawn(move || -> Result<()> {
         let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
         let mut buf = [0u8; 4096];
+        let mut detector = DetachDetector::new();
         loop {
             let mut read: u32 = 0;
             let r = unsafe {
@@ -289,8 +373,8 @@ fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
                 Ok(()) if read == 0 => break,
                 Ok(()) => {
                     let data = &buf[..read as usize];
-                    // Detach sequence: "~." optionally followed by CR/LF.
-                    if data == b"~.\r" || data == b"~.\n" || data == b"~." {
+                    let (forward, detach) = detector.feed(data);
+                    if detach {
                         // Unblock the main thread's ReadFile on the out pipe.
                         // Retry in a loop: the main thread may not have posted its
                         // read yet when the first cancellation is issued.
@@ -305,22 +389,8 @@ fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
                         }
                         break;
                     }
-                    let mut pos = 0;
-                    while pos < data.len() {
-                        let mut written: u32 = 0;
-                        let r2 = unsafe {
-                            WriteFile(
-                                h_in,
-                                Some(&data[pos..]),
-                                Some(&mut written),
-                                None,
-                            )
-                        };
-                        match r2 {
-                            Ok(()) if written > 0 => pos += written as usize,
-                            Ok(()) => break,
-                            Err(_) => return Ok(()),
-                        }
+                    if !forward.is_empty() && !write_all(h_in, &forward)? {
+                        return Ok(());
                     }
                 }
                 Err(_) => break,
@@ -374,4 +444,40 @@ fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
     drop(stdin_thread);
     println!("\r\ndetached");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DetachDetector;
+
+    #[test]
+    fn detach_sequence_split_across_reads() {
+        let mut d = DetachDetector::new();
+        assert_eq!(d.feed(b"~"), (Vec::new(), false));
+        assert_eq!(d.feed(b"."), (Vec::new(), true));
+    }
+
+    #[test]
+    fn tilde_inside_a_line_is_forwarded_unchanged() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"cd ~/x\r");
+        assert!(!detach);
+        assert_eq!(&out[..], &b"cd ~/x\r"[..]);
+    }
+
+    #[test]
+    fn tilde_at_line_start_followed_by_other_char() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"~a");
+        assert!(!detach);
+        assert_eq!(&out[..], &b"~a"[..]);
+    }
+
+    #[test]
+    fn detach_only_at_line_start() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"x~.");
+        assert!(!detach);
+        assert_eq!(&out[..], &b"x~."[..]);
+    }
 }

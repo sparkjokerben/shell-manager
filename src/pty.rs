@@ -14,6 +14,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Console::{
     CreatePseudoConsole, ClosePseudoConsole, COORD, HPCON,
+    GetConsoleMode, GetStdHandle, SetStdHandle, CONSOLE_MODE,
+    STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
@@ -58,7 +60,7 @@ impl Pty {
         let mut output_read: HANDLE = unsafe { mem::zeroed() };
         let mut output_write: HANDLE = unsafe { mem::zeroed() };
         unsafe {
-            CreatePipe(&mut output_read, &mut output_write, None, 0)
+            CreatePipe(&mut output_read, &mut output_write, None, 64 * 1024)
                 .context("CreatePipe (output) failed")?;
         }
 
@@ -148,6 +150,12 @@ impl Pty {
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
         let flags = EXTENDED_STARTUPINFO_PRESENT;
+
+        // Windows copies the parent's standard handles into the child's process
+        // parameters, and a redirected file/pipe handle wins over the pseudo
+        // console: the shell would then read/write the daemon's own stdio instead
+        // of the PTY. Hide those handles for the duration of CreateProcessW.
+        let _stdio = StdioHider::install();
 
         unsafe {
             windows::Win32::System::Threading::CreateProcessW(
@@ -245,6 +253,50 @@ impl Pty {
     /// Child process ID.
     pub fn process_id(&self) -> Option<u32> {
         self.process.as_ref().map(|pi| pi.dwProcessId)
+    }
+}
+
+/// Temporarily clears standard handles that point at files or pipes.
+///
+/// Console handles are process-local and cannot leak into a child process, so
+/// they are left untouched; only redirected handles need hiding.
+struct StdioHider {
+    saved: Vec<(STD_HANDLE, HANDLE)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl StdioHider {
+    fn install() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut saved = Vec::new();
+
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe {
+                let h = match GetStdHandle(id) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                let mut mode = CONSOLE_MODE(0);
+                if GetConsoleMode(h, &mut mode).is_ok() {
+                    continue;
+                }
+                saved.push((id, h));
+                let _ = SetStdHandle(id, HANDLE::default());
+            }
+        }
+
+        Self { saved, _lock: lock }
+    }
+}
+
+impl Drop for StdioHider {
+    fn drop(&mut self) {
+        unsafe {
+            for (id, h) in self.saved.drain(..) {
+                let _ = SetStdHandle(id, h);
+            }
+        }
     }
 }
 

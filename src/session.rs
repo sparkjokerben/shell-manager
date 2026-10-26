@@ -185,7 +185,7 @@ fn run_in_thread(
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
 ) {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 8192];
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -240,7 +240,7 @@ fn run_out_thread(
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
 ) {
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 8192];
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -300,7 +300,7 @@ fn run_out_thread(
                 if !pty.lock().unwrap().is_running() {
                     break 'forward;
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(2));
             }
         }
 

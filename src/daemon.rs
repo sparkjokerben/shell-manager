@@ -143,6 +143,7 @@ fn dispatch(req: &Request, sessions: &SessionTable) -> Response {
         Op::Continue => handle_continue(&req.name, req.cols, req.rows, sessions),
         Op::List => handle_list(sessions),
         Op::Stop => handle_stop(&req.name, sessions),
+        Op::Resize => handle_resize(&req.name, req.cols, req.rows, sessions),
     }
 }
 
@@ -217,6 +218,26 @@ fn handle_continue(
         "pipe_in": pipe_in,
     });
     Response::ok(Some(data))
+}
+
+fn handle_resize(
+    name: &str,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    sessions: &SessionTable,
+) -> Response {
+    let table = sessions.lock().unwrap();
+    let session = match table.get(name) {
+        Some(s) => s,
+        None => return Response::err(format!("session '{}' not found", name)),
+    };
+    match (cols, rows) {
+        (Some(c), Some(r)) => match session.resize(c.max(1), r.max(1)) {
+            Ok(()) => Response::ok(None),
+            Err(e) => Response::err(format!("resize failed: {}", e)),
+        },
+        _ => Response::ok(None),
+    }
 }
 
 fn handle_list(sessions: &SessionTable) -> Response {
