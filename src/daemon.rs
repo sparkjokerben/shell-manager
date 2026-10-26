@@ -7,7 +7,6 @@ use crate::session::{Session, SessionState};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
 use windows::Win32::System::Pipes::{
@@ -58,25 +57,20 @@ impl Daemon {
     }
 
     /// Main loop: accept control-pipe connections and serve requests.
+    ///
+    /// Connections are handled serially: each request is short-lived
+    /// (START/CONTINUE/LIST/STOP), so no per-connection thread is needed.
     pub fn run(&mut self) -> Result<()> {
         println!("shell-daemon listening on {}", CONTROL_PIPE);
 
         loop {
-            let connected = unsafe { ConnectNamedPipe(self.control_pipe, None).is_ok() };
+            let connected = unsafe { crate::protocol::is_pipe_connected(&ConnectNamedPipe(self.control_pipe, None)) };
             if !connected {
-                // Brief retry loop
                 continue;
             }
 
-            let sessions = self.sessions.clone();
-            let pipe = self.control_pipe;
-
-            thread::spawn(move || -> anyhow::Result<()> {
-                let _ = handle_control_connection(pipe, sessions);
-                // Reconnect the server pipe instance for the next client.
-                unsafe { DisconnectNamedPipe(pipe) }.ok();
-                Ok(())
-            });
+            let _ = handle_control_connection(self.control_pipe, self.sessions.clone());
+            unsafe { DisconnectNamedPipe(self.control_pipe) }.ok();
         }
     }
 }
@@ -132,8 +126,11 @@ fn handle_control_connection(pipe: HANDLE, sessions: SessionTable) -> Result<()>
         .map_err(|e| anyhow::anyhow!("WriteFile failed: {}", e))?;
     }
 
+    // Ensure the response is delivered before the caller disconnects the pipe;
+    // otherwise DisconnectNamedPipe may discard buffered data the client hasn't read yet.
     unsafe {
-        let _ = DisconnectNamedPipe(pipe);
+        windows::Win32::Storage::FileSystem::FlushFileBuffers(pipe)
+            .map_err(|e| anyhow::anyhow!("FlushFileBuffers failed: {}", e))?;
     }
 
     Ok(())

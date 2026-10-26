@@ -135,6 +135,7 @@ impl Pty {
         let mut cmd_buf = wide;
 
         let mut si: STARTUPINFOEXW = unsafe { mem::zeroed() };
+        si.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
         si.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
         si.StartupInfo.wShowWindow = SW_HIDE.0 as u16;
         si.lpAttributeList = self.attr_list_buf.as_ref().map(|_| attr_list_ptr).unwrap_or(attr_list_ptr);
@@ -196,6 +197,26 @@ impl Pty {
         Ok(read)
     }
 
+    /// Number of bytes currently available to read without blocking.
+    ///
+    /// Uses PeekNamedPipe on the PTY output pipe. Returns `Err` when the
+    /// pipe is broken (child exited).
+    pub fn available(&self) -> Result<u32> {
+        let mut avail: u32 = 0;
+        unsafe {
+            windows::Win32::System::Pipes::PeekNamedPipe(
+                self.output_read,
+                None,
+                0,
+                None,
+                Some(&mut avail),
+                None,
+            )
+            .context("PeekNamedPipe on PTY output failed")?;
+        }
+        Ok(avail)
+    }
+
     /// Child process ID.
     pub fn process_id(&self) -> Option<u32> {
         self.process.as_ref().map(|pi| pi.dwProcessId)
@@ -206,6 +227,10 @@ impl Drop for Pty {
     fn drop(&mut self) {
         if let Some(pi) = self.process.take() {
             unsafe {
+                // Terminate the shell before closing the pseudo console:
+                // ClosePseudoConsole can block until all attached processes exit.
+                let _ = windows::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
+                let _ = windows::Win32::System::Threading::WaitForSingleObject(pi.hProcess, 2000);
                 let _ = CloseHandle(pi.hProcess);
                 let _ = CloseHandle(pi.hThread);
             }

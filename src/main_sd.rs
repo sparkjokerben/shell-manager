@@ -125,27 +125,33 @@ fn attach(pipe_name: &str) -> Result<()> {
     }
 
     // Put the local console into raw mode so input passes through byte-for-byte.
+    // If stdin/stdout are not real consoles (e.g. piped), skip raw mode but keep forwarding.
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE)? };
     let mut orig_in_mode: CONSOLE_MODE = CONSOLE_MODE(0);
     let mut orig_out_mode: CONSOLE_MODE = CONSOLE_MODE(0);
-    unsafe {
-        GetConsoleMode(stdin, &mut orig_in_mode)?;
-        GetConsoleMode(stdout, &mut orig_out_mode)?;
-    }
-    let raw_in = orig_in_mode.0
-        & !(ENABLE_LINE_INPUT.0
-            | ENABLE_ECHO_INPUT.0
-            | ENABLE_PROCESSED_INPUT.0
-            | ENABLE_WINDOW_INPUT.0
-            | ENABLE_MOUSE_INPUT.0);
-    let raw_out = orig_out_mode.0 & !(ENABLE_PROCESSED_OUTPUT.0 | ENABLE_WRAP_AT_EOL_OUTPUT.0);
-    unsafe {
-        SetConsoleMode(stdin, CONSOLE_MODE(raw_in))?;
-        SetConsoleMode(stdout, CONSOLE_MODE(raw_out))?;
+    let has_console = unsafe {
+        GetConsoleMode(stdin, &mut orig_in_mode).is_ok()
+            && GetConsoleMode(stdout, &mut orig_out_mode).is_ok()
+    };
+    if has_console {
+        let raw_in = orig_in_mode.0
+            & !(ENABLE_LINE_INPUT.0
+                | ENABLE_ECHO_INPUT.0
+                | ENABLE_PROCESSED_INPUT.0
+                | ENABLE_WINDOW_INPUT.0
+                | ENABLE_MOUSE_INPUT.0);
+        let raw_out = orig_out_mode.0 & !(ENABLE_PROCESSED_OUTPUT.0 | ENABLE_WRAP_AT_EOL_OUTPUT.0);
+        unsafe {
+            SetConsoleMode(stdin, CONSOLE_MODE(raw_in))?;
+            SetConsoleMode(stdout, CONSOLE_MODE(raw_out))?;
+        }
+    } else {
+        eprintln!("[sd] no console detected; forwarding without raw mode");
     }
 
     struct Guard {
+        active: bool,
         stdin: HANDLE,
         stdout: HANDLE,
         in_mode: CONSOLE_MODE,
@@ -153,13 +159,16 @@ fn attach(pipe_name: &str) -> Result<()> {
     }
     impl Drop for Guard {
         fn drop(&mut self) {
-            unsafe {
-                let _ = SetConsoleMode(self.stdin, self.in_mode);
-                let _ = SetConsoleMode(self.stdout, self.out_mode);
+            if self.active {
+                unsafe {
+                    let _ = SetConsoleMode(self.stdin, self.in_mode);
+                    let _ = SetConsoleMode(self.stdout, self.out_mode);
+                }
             }
         }
     }
     let _guard = Guard {
+        active: has_console,
         stdin,
         stdout,
         in_mode: orig_in_mode,

@@ -34,9 +34,9 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
 
@@ -47,6 +47,18 @@ impl Response {
 
     pub fn err(msg: impl Into<String>) -> Self {
         Self { ok: false, error: msg.into(), data: None }
+    }
+}
+
+/// True when a `ConnectNamedPipe` result means the client is connected.
+///
+/// `ConnectNamedPipe` reports `ERROR_PIPE_CONNECTED` (Win32 535,
+/// HRESULT 0x80070217) when a client connected before the server called it.
+/// That is a successful connection, not a failure.
+pub fn is_pipe_connected(result: &windows::core::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) => (e.code().0 as u32) == 0x8007_0217u32,
     }
 }
 

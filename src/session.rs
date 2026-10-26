@@ -41,6 +41,8 @@ pub struct Session {
     pub data_pipe_client: Arc<Mutex<Option<HANDLE>>>,
     /// Sender to signal the accept thread to stop.
     pub stop_tx: Mutex<Option<Sender<()>>>,
+    /// Win32 thread id of the accept thread, used to cancel its blocking ConnectNamedPipe.
+    pub accept_tid: Arc<Mutex<Option<u32>>>,
 }
 
 impl Session {
@@ -57,6 +59,7 @@ impl Session {
             data_pipe_server: Arc::new(Mutex::new(None)),
             data_pipe_client: Arc::new(Mutex::new(None)),
             stop_tx: Mutex::new(None),
+            accept_tid: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -94,6 +97,7 @@ impl Session {
         let data_pipe_server = self.data_pipe_server.clone();
         let pty = self.pty.clone();
         let data_pipe_client = self.data_pipe_client.clone();
+        let accept_tid = self.accept_tid.clone();
         let (tx, rx) = channel();
         *self.stop_tx.lock().unwrap() = Some(tx);
 
@@ -101,6 +105,10 @@ impl Session {
         let session_id = self.session_id.clone();
 
         thread::spawn(move || {
+            // Publish this thread's id so stop() can cancel the blocking ConnectNamedPipe.
+            let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+            *accept_tid.lock().unwrap() = Some(tid);
+
             let _ = accept_data_pipe(
                 h,
                 rx,
@@ -111,6 +119,11 @@ impl Session {
                 session_name,
                 session_id,
             );
+
+            // The accept thread owns the server handle; close it when it exits.
+            unsafe {
+                let _ = CloseHandle(h);
+            }
         });
 
         Ok(())
@@ -136,11 +149,18 @@ impl Session {
             let _ = tx.send(());
         }
 
-        // Close the server pipe handle.
-        if let Some(h) = self.data_pipe_server.lock().unwrap().take() {
+        // Wake the accept thread out of its blocking ConnectNamedPipe.
+        // Do NOT call DisconnectNamedPipe here: it would deadlock against the
+        // pending ConnectNamedPipe in the accept thread.
+        let tid = *self.accept_tid.lock().unwrap();
+        if let Some(tid) = tid {
             unsafe {
-                let _ = DisconnectNamedPipe(h);
-                let _ = CloseHandle(h);
+                use windows::Win32::System::IO::CancelSynchronousIo;
+                use windows::Win32::System::Threading::{OpenThread, THREAD_TERMINATE};
+                if let Ok(ht) = OpenThread(THREAD_TERMINATE, false, tid) {
+                    let _ = CancelSynchronousIo(ht);
+                    let _ = CloseHandle(ht);
+                }
             }
         }
 
@@ -167,7 +187,10 @@ fn accept_data_pipe(
             break;
         }
 
-        let connected = unsafe { ConnectNamedPipe(server, None).is_ok() };
+        eprintln!("[session {}] waiting for client on data pipe", _session_name);
+        let connected = unsafe {
+            crate::protocol::is_pipe_connected(&ConnectNamedPipe(server, None))
+        };
         if !connected {
             // Pipe disconnected or error; check stop again briefly.
             if stop_rx.recv_timeout(Duration::from_millis(100)).is_ok() {
@@ -180,6 +203,7 @@ fn accept_data_pipe(
         *state.lock().unwrap() = SessionState::Attached;
         *data_pipe_client.lock().unwrap() = Some(server);
 
+        let client_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let pty_out = pty.clone();
         let pty_in = pty.clone();
         let state_clone = state.clone();
@@ -187,14 +211,16 @@ fn accept_data_pipe(
         let client = server;
 
         // Forward PTY output -> data pipe.
+        let alive_out = client_alive.clone();
         let out_thread = thread::spawn(move || {
-            forward_pty_to_pipe(&pty_out, client);
+            forward_pty_to_pipe(&pty_out, client, &alive_out);
         });
 
         // Forward data pipe input -> PTY.
         let state_clone2 = state_clone.clone();
+        let alive_in = client_alive.clone();
         let in_thread = thread::spawn(move || {
-            forward_pipe_to_pty(&pty_in, client);
+            forward_pipe_to_pty(&pty_in, client, &alive_in);
         });
 
         // Wait for either direction to finish.
@@ -212,37 +238,69 @@ fn accept_data_pipe(
 }
 
 /// Forward PTY output to the named pipe.
-fn forward_pty_to_pipe(pty: &Arc<Mutex<Pty>>, pipe: HANDLE) {
+///
+/// Uses PeekNamedPipe so the thread can notice a disconnected client
+/// (`alive` becomes false) instead of blocking forever in ReadFile.
+fn forward_pty_to_pipe(
+    pty: &Arc<Mutex<Pty>>,
+    pipe: HANDLE,
+    alive: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
     let mut buf = [0u8; 4096];
     loop {
-        match pty.lock().unwrap().read_output(&mut buf) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                let n = n as usize;
-                let mut pos: usize = 0;
-                while pos < n {
-                    let mut written: u32 = 0;
-                    match unsafe {
-                        WriteFile(
-                            pipe,
-                            Some(&buf[pos..n]),
-                            Some(&mut written),
-                            None,
-                        )
-                    } {
-                        Ok(()) if written > 0 => pos += written as usize,
-                        Ok(()) => break,
-                        Err(_) => return,
+        let avail = {
+            let p = pty.lock().unwrap();
+            match p.available() {
+                Ok(n) => n,
+                // Broken pipe: child process exited.
+                Err(_) => break,
+            }
+        };
+
+        if avail > 0 {
+            let n = match pty.lock().unwrap().read_output(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n as usize,
+                Err(_) => break,
+            };
+            let mut pos: usize = 0;
+            while pos < n {
+                let mut written: u32 = 0;
+                match unsafe {
+                    WriteFile(
+                        pipe,
+                        Some(&buf[pos..n]),
+                        Some(&mut written),
+                        None,
+                    )
+                } {
+                    Ok(()) if written > 0 => pos += written as usize,
+                    Ok(()) => break,
+                    // Client gone.
+                    Err(_) => {
+                        alive.store(false, Ordering::Relaxed);
+                        return;
                     }
                 }
             }
-            Err(_) => break,
+        } else {
+            // No pending output; stop once the client is gone.
+            if !alive.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 }
 
 /// Forward named pipe input to the PTY.
-fn forward_pipe_to_pty(pty: &Arc<Mutex<Pty>>, pipe: HANDLE) {
+fn forward_pipe_to_pty(
+    pty: &Arc<Mutex<Pty>>,
+    pipe: HANDLE,
+    alive: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
     let mut buf = [0u8; 4096];
     loop {
         let mut read: u32 = 0;
@@ -255,13 +313,15 @@ fn forward_pipe_to_pty(pty: &Arc<Mutex<Pty>>, pipe: HANDLE) {
             )
         };
         match result {
-            Ok(()) if read == 0 => break, // EOF
+            Ok(()) if read == 0 => break, // EOF: client disconnected
             Ok(()) => {
                 let _ = pty.lock().unwrap().write_input(&buf[..read as usize]);
             }
             Err(_) => break,
         }
     }
+    // Signal the output thread that the client is gone.
+    alive.store(false, Ordering::Relaxed);
 }
 
 impl Drop for Session {
