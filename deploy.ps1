@@ -14,10 +14,16 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 $bin = Join-Path $env:USERPROFILE "bin"
 New-Item -ItemType Directory -Force -Path $bin | Out-Null
 
+# Client first: replacing sd.exe never disturbs a running session. A running
+# client keeps its image locked, but renaming the image out of the way works.
+$sd = Join-Path $bin "sd.exe"
+if (Test-Path $sd) { Move-Item -Force $sd (Join-Path $bin "sd.old.exe") }
+Copy-Item "target\release\sd.exe" $sd -Force
+
 # Never restart the daemon while it still hosts sessions: that would kill them.
-$sessions = & (Join-Path $bin "sd.exe") list 2>$null
+$sessions = & $sd list 2>$null
 if ($sessions) {
-    Write-Warning "Live sessions exist, daemon left running (new code loads on next daemon start):"
+    Write-Warning "Live sessions exist, daemon left running (it keeps its image until the next restart):"
     $sessions | ForEach-Object { Write-Host "  $_" }
     exit 0
 }
@@ -25,12 +31,6 @@ if ($sessions) {
 # Stop the daemon before copying: a running image cannot be overwritten.
 Stop-Process -Name shell-daemon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
-
-# A running client keeps sd.exe locked; renaming the image out of the way is
-# allowed, overwriting it is not.
-$sd = Join-Path $bin "sd.exe"
-if (Test-Path $sd) { Move-Item -Force $sd (Join-Path $bin "sd.old.exe") }
-Copy-Item "target\release\sd.exe" $sd -Force
 Copy-Item "target\release\shell-daemon.exe" (Join-Path $bin "shell-daemon.exe") -Force
 
 # Hidden launcher used by the logon task; it also pins the daemon's working

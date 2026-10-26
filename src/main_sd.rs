@@ -285,6 +285,55 @@ const DETACH_SEQS: &[&[u8]] = &[b"@@detach", b"\x1b[24~", b"\x1d"];
 /// leak into the shell as typed garbage.
 const MOUSE_RESET: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
+/// DECRST 9001: turn "Win32 input mode" off (Windows Terminal extension).
+///
+/// PowerShell 7 enables it via `CSI ? 9001 h`. A terminal that honours it stops
+/// sending plain VT keystrokes and instead encodes every key as
+/// `CSI Vk;Sc;Uc;Kd;Cs;Rc _`, which matches none of the detach sequences and
+/// leaves the mouse filter nothing to recognise. The client therefore hides the
+/// request from the terminal and switches the mode off on every attach.
+const WIN32_INPUT_OFF: &[u8] = b"\x1b[?9001l";
+
+/// Sequence prefix the hosted app uses to enable Win32 input mode.
+const WIN32_INPUT_SEQ: &[u8] = b"\x1b[?9001";
+
+/// Drop `CSI ? 9001 h|l` from the PTY output so the terminal keeps encoding
+/// input as ordinary VT bytes. A sequence split across reads is held in `carry`
+/// until its final byte arrives.
+fn strip_win32_input_mode(data: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(carry.len() + data.len());
+    buf.extend_from_slice(carry);
+    buf.extend_from_slice(data);
+    carry.clear();
+
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        let rest = &buf[i..];
+        if rest.starts_with(WIN32_INPUT_SEQ) {
+            if rest.len() == WIN32_INPUT_SEQ.len() {
+                // Final byte not seen yet.
+                carry.extend_from_slice(rest);
+                break;
+            }
+            if matches!(rest[WIN32_INPUT_SEQ.len()], b'h' | b'l') {
+                i += WIN32_INPUT_SEQ.len() + 1;
+                continue;
+            }
+        } else if rest.len() >= 2
+            && rest.len() < WIN32_INPUT_SEQ.len()
+            && WIN32_INPUT_SEQ.starts_with(rest)
+        {
+            // Possible prefix of the sequence at the end of this chunk.
+            carry.extend_from_slice(rest);
+            break;
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Wait (bounded) for the reader thread to publish its thread id, then cancel
 /// its blocking read until it reports done.
 fn stop_reader(reader_tid: &AtomicU32, reader_done: &AtomicBool) {
@@ -365,6 +414,96 @@ fn partial_suffix(data: &[u8], needle: &[u8]) -> usize {
         .rev()
         .find(|&k| data.ends_with(&needle[..k]))
         .unwrap_or(0)
+}
+
+/// Recognises the detach triggers inside Win32-input-mode key reports.
+///
+/// A terminal that honours `CSI ? 9001 h` sends every key as
+/// `CSI Vk;Sc;Uc;Kd;Cs;Rc _` instead of plain bytes. The client keeps terminals
+/// out of that mode (see `WIN32_INPUT_OFF`), but one that was already switched -
+/// or that ignores the reset - keeps encoding keystrokes this way, so the
+/// triggers are recognised here too.
+struct Win32Detach {
+    /// Printable characters seen recently, for matching the typed trigger.
+    typed: Vec<u8>,
+    /// Trailing bytes that may start a report split across reads.
+    carry: Vec<u8>,
+}
+
+impl Win32Detach {
+    fn new() -> Self {
+        Self {
+            typed: Vec::new(),
+            carry: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, data: &[u8]) -> bool {
+        let mut buf = Vec::with_capacity(self.carry.len() + data.len());
+        buf.extend_from_slice(&self.carry);
+        buf.extend_from_slice(data);
+        self.carry.clear();
+
+        let mut hit = false;
+        let mut i = 0;
+        while i + 1 < buf.len() {
+            if buf[i] != 0x1b || buf[i + 1] != b'[' {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 2;
+            while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+                j += 1;
+            }
+            if j >= buf.len() {
+                // Incomplete report: keep it for the next read.
+                self.carry.extend_from_slice(&buf[i..]);
+                break;
+            }
+            if buf[j] == b'_' {
+                hit |= self.inspect(&buf[i + 2..j]);
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        hit
+    }
+
+    /// `params` holds the text between `CSI` and the `_` terminator.
+    fn inspect(&mut self, params: &[u8]) -> bool {
+        let Ok(text) = std::str::from_utf8(params) else {
+            return false;
+        };
+        let fields: Vec<u32> = text
+            .split(';')
+            .filter_map(|f| f.parse::<u32>().ok())
+            .collect();
+        // Vk;Sc;Uc;Kd;Cs;Rc
+        if fields.len() != 6 {
+            return false;
+        }
+        let (uc, kd, cs) = (fields[2], fields[3], fields[4]);
+        if kd == 0 {
+            return false; // key-up: the key-down already carried the character
+        }
+        let ctrl = cs & (4 | 8) != 0; // RIGHT_CTRL_PRESSED | LEFT_CTRL_PRESSED
+        if ctrl && (uc == 0x1d || uc == 0x5d) {
+            return true; // Ctrl+]
+        }
+        if !ctrl && uc != 0 {
+            if let Some(ch) = char::from_u32(uc) {
+                let mut utf8 = [0u8; 4];
+                self.typed.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+                if self.typed.len() > 16 {
+                    let cut = self.typed.len() - 16;
+                    self.typed.drain(..cut);
+                }
+                return self.typed.ends_with(b"@@detach");
+            }
+        }
+        false
+    }
 }
 
 /// Removes hover-only mouse motion reports (SGR and X10 encodings).
@@ -476,6 +615,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     // Start from a clean terminal state, then restore the mouse modes the
     // hosted app had enabled before this client attached.
     if has_console {
+        let _ = write_all(stdout, WIN32_INPUT_OFF);
         let _ = write_all(stdout, MOUSE_RESET);
         if initial_mouse_on {
             let mut seq = Vec::new();
@@ -618,6 +758,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
         let mut buf = [0u8; 4096];
         let mut detector = DetachDetector::new();
         let mut motion_pending: Vec<u8> = Vec::new();
+        let mut win32 = Win32Detach::new();
         let mut hover_reads: u32 = 0;
         client_log("stdin thread started");
         loop {
@@ -637,25 +778,34 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                 }
                 Ok(()) => {
                     let raw = &buf[..read as usize];
+                    // A terminal in Win32 input mode encodes keys as reports, so
+                    // the triggers have to be looked for there as well.
+                    let win32_hit = win32.feed(raw);
                     let filtered = filter_motion(raw, &mut motion_pending);
                     let data = &filtered[..];
-                    if data.is_empty() {
+                    if data.is_empty() && !win32_hit {
                         hover_reads += 1;
                         if hover_reads % 100 == 0 {
                             client_log(&format!("hover reports dropped so far: {}", hover_reads));
                         }
                         continue;
                     }
-                    client_log(&format!(
-                        "stdin read {}: {} | filtered {}: {}",
-                        read,
-                        hex_short(raw),
-                        data.len(),
-                        hex_short(data)
-                    ));
+                    if !data.is_empty() {
+                        client_log(&format!(
+                            "stdin read {}: {} | filtered {}: {}",
+                            read,
+                            hex_short(raw),
+                            data.len(),
+                            hex_short(data)
+                        ));
+                    }
                     let (forward, detach) = detector.feed(data);
-                    if detach {
-                        client_log("detach matched");
+                    if detach || win32_hit {
+                        client_log(if detach {
+                            "detach matched"
+                        } else {
+                            "detach matched (win32 report)"
+                        });
                         // Forward whatever preceded the key on this read before
                         // tearing the connection down.
                         if !forward.is_empty() {
@@ -696,6 +846,8 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
         let mut mouse_state = mouse;
         let mut mouse_on = mouse & 0b111 != 0;
         let mut mouse_carry: Vec<u8> = Vec::new();
+        // Holds a split `CSI ? 9001 h|l` between reads; see strip_win32_input_mode.
+        let mut mode_carry: Vec<u8> = Vec::new();
         loop {
             let mut read: u32 = 0;
             let r = unsafe {
@@ -763,6 +915,9 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                     } else {
                         chunk.to_vec()
                     };
+                    // Keep the terminal out of Win32 input mode, otherwise keys
+                    // arrive as CSI reports instead of plain VT bytes.
+                    let data = strip_win32_input_mode(&data, &mut mode_carry);
                     if !data.is_empty() {
                         // A cancelled console write must only end this thread,
                         // never panic the process.
@@ -803,7 +958,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_motion, DetachDetector};
+    use super::{filter_motion, strip_win32_input_mode, DetachDetector, Win32Detach};
 
     #[test]
     fn magic_sequence_detaches() {
@@ -927,5 +1082,84 @@ mod tests {
     fn lone_escape_is_forwarded() {
         let mut p = Vec::new();
         assert_eq!(&filter_motion(b"\x1b", &mut p)[..], b"\x1b");
+    }
+
+    #[test]
+    fn win32_input_mode_request_is_dropped() {
+        let mut carry = Vec::new();
+        assert_eq!(
+            &strip_win32_input_mode(b"a\x1b[?9001hb", &mut carry)[..],
+            b"ab"
+        );
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn win32_input_mode_sequence_split_across_reads() {
+        let mut carry = Vec::new();
+        assert_eq!(&strip_win32_input_mode(b"a\x1b[?90", &mut carry)[..], b"a");
+        assert_eq!(&strip_win32_input_mode(b"01hb", &mut carry)[..], b"b");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn win32_input_mode_sequence_split_at_final_byte() {
+        let mut carry = Vec::new();
+        assert_eq!(&strip_win32_input_mode(b"\x1b[?9001", &mut carry)[..], b"");
+        assert_eq!(&strip_win32_input_mode(b"l", &mut carry)[..], b"");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn other_private_modes_survive_stripping() {
+        let mut carry = Vec::new();
+        let out = strip_win32_input_mode(b"\x1b[?1003h\x1b[?9001l\x1b[?25l", &mut carry);
+        assert_eq!(&out[..], b"\x1b[?1003h\x1b[?25l");
+    }
+
+    #[test]
+    fn trailing_escape_survives_stripping() {
+        let mut carry = Vec::new();
+        assert_eq!(&strip_win32_input_mode(b"x\x1b", &mut carry)[..], b"x\x1b");
+        assert!(carry.is_empty());
+    }
+
+    /// `CSI Vk;Sc;Uc;Kd;Cs;Rc _` report for one key event.
+    fn win32_report(vk: u32, uc: u32, cs: u32, kd: u32) -> Vec<u8> {
+        format!("\x1b[{};0;{};{};{};1_", vk, uc, kd, cs).into_bytes()
+    }
+
+    #[test]
+    fn win32_typed_trigger_detaches() {
+        let mut d = Win32Detach::new();
+        let mut hit = false;
+        for ch in "@@detach".chars() {
+            hit |= d.feed(&win32_report(0, ch as u32, 0, 1));
+        }
+        assert!(hit);
+    }
+
+    #[test]
+    fn win32_ctrl_bracket_detaches() {
+        let mut d = Win32Detach::new();
+        assert!(d.feed(&win32_report(221, 0x1d, 8, 1)));
+    }
+
+    #[test]
+    fn win32_keyup_and_partial_text_do_not_detach() {
+        let mut d = Win32Detach::new();
+        assert!(!d.feed(&win32_report(221, 0x1d, 8, 0))); // key-up
+        for ch in "@@deta".chars() {
+            assert!(!d.feed(&win32_report(0, ch as u32, 0, 1)));
+        }
+    }
+
+    #[test]
+    fn win32_report_split_across_reads_is_recognised() {
+        let mut d = Win32Detach::new();
+        let seq = win32_report(221, 0x1d, 8, 1);
+        let (head, tail) = seq.split_at(5);
+        assert!(!d.feed(head));
+        assert!(d.feed(tail));
     }
 }
