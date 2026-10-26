@@ -339,6 +339,7 @@ export default function App() {
     }
 
     setNewOpen(false);
+    closeDrawer();
     setSessions((current) =>
       current.some((session) => session.name === draft.name)
         ? current
@@ -425,8 +426,12 @@ export default function App() {
   };
 
   const handleTokenSubmit = (value: string) => {
-    saveToken(value);
-    setToken(value);
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return;
+    }
+    saveToken(trimmed);
+    setToken(trimmed);
     setTokenGate(null);
     setAuthBlocked(false);
     setSessionsError(null);
@@ -607,6 +612,7 @@ export default function App() {
           error={sessionsError}
           hasToken={hasToken}
           tokenRequired={tokenRequired || authBlocked}
+          tokenKnown={health !== null}
           open={drawerOpen}
           onClose={closeDrawer}
           onRefresh={refreshNow}

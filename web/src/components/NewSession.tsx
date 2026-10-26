@@ -24,6 +24,9 @@ function validateName(raw: string): string | null {
   if (/[\\/]/.test(raw)) {
     return "Names cannot contain slashes.";
   }
+  if (raw === "." || raw === "..") {
+    return "Names cannot be . or ..";
+  }
   return null;
 }
 

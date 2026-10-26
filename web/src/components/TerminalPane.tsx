@@ -47,6 +47,22 @@ const TERMINAL_THEME = {
   brightWhite: "#f3edde",
 };
 
+const MOUSE_RESET = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+
+/**
+ * Re-create the DEC mouse modes the hosted app had enabled at attach time.
+ * The daemon reports them as a bitmask because a reattached client never sees
+ * the original `?1000h`-style sequences.
+ */
+function mouseSequences(mouse: number): string {
+  let sequence = MOUSE_RESET;
+  if (mouse & 1) sequence += "\x1b[?1000h";
+  if (mouse & 2) sequence += "\x1b[?1002h";
+  if (mouse & 4) sequence += "\x1b[?1003h";
+  if (mouse & 8) sequence += "\x1b[?1006h";
+  return sequence;
+}
+
 function parseServerMessage(raw: string): WsServerMessage | null {
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -120,6 +136,7 @@ export function TerminalPane({
   const attachedRef = useRef(session.attached);
   const initialAttachSignalRef = useRef(attachSignal);
   const encoderRef = useRef(new TextEncoder());
+  const pendingInputRef = useRef<string[]>([]);
   const onConnectionChangeRef = useRef(onConnectionChange);
 
   const [phase, setPhase] = useState<ConnectionPhase>("connecting");
@@ -205,10 +222,33 @@ export function TerminalPane({
 
     const dataDisposable = terminal.onData((data) => {
       const socket = socketRef.current;
-      if (!readyRef.current || socket?.readyState !== WebSocket.OPEN) {
+      if (socket?.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      if (!readyRef.current) {
+        // Hold a few characters typed while the handshake is in flight.
+        const pending = pendingInputRef.current;
+        const length = pending.reduce((total, part) => total + part.length, 0);
+        if (length + data.length <= 4096) {
+          pending.push(data);
+        }
         return;
       }
       socket.send(encoderRef.current.encode(data));
+    });
+
+    // xterm reports X10 mouse encoding (and other binary input) through
+    // onBinary, not onData. Without this subscription those reports vanish.
+    const binaryDisposable = terminal.onBinary((data) => {
+      const socket = socketRef.current;
+      if (!readyRef.current || socket?.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const bytes = new Uint8Array(data.length);
+      for (let i = 0; i < data.length; i += 1) {
+        bytes[i] = data.charCodeAt(i) & 0xff;
+      }
+      socket.send(bytes);
     });
 
     const resizeDisposable = terminal.onResize(({ cols, rows }) => {
@@ -232,6 +272,7 @@ export function TerminalPane({
     return () => {
       resizeObserver.disconnect();
       dataDisposable.dispose();
+      binaryDisposable.dispose();
       resizeDisposable.dispose();
       if (resizeTimerRef.current !== null) {
         window.clearTimeout(resizeTimerRef.current);
@@ -265,6 +306,10 @@ export function TerminalPane({
     );
 
     fitTerminal();
+    // Start each connection from a clean screen: the daemon repaints the
+    // hosted app's current screen, and stale rows from the previous attach
+    // would otherwise be duplicated.
+    terminal.reset();
 
     const url = buildWebSocketUrl(
       session.name,
@@ -287,6 +332,19 @@ export function TerminalPane({
     socketRef.current = socket;
 
     const isCurrent = () => connectionSeqRef.current === seq;
+    const readyTimer = window.setTimeout(() => {
+      if (!isCurrent() || readyRef.current) {
+        return;
+      }
+      lastEventRef.current = "error";
+      setPhase("error");
+      setDetail("The connection did not become ready within 15 seconds. smw may be unreachable.");
+      try {
+        socket.close(1000, "ready timeout");
+      } catch {
+        // Already closing.
+      }
+    }, 15_000);
 
     socket.onopen = () => {
       if (!isCurrent()) {
@@ -306,16 +364,24 @@ export function TerminalPane({
           return;
         }
         if (message.type === "ready") {
+          window.clearTimeout(readyTimer);
           readyRef.current = true;
           lastEventRef.current = null;
           setPhase("connected");
           setDetail(`Connected to ${message.name} on ${message.instance}.`);
           setOccupied(false);
+          terminal.write(mouseSequences(message.mouse));
+          const pending = pendingInputRef.current;
+          pendingInputRef.current = [];
+          if (pending.length > 0 && socket.readyState === WebSocket.OPEN) {
+            socket.send(encoderRef.current.encode(pending.join("")));
+          }
           sendMessage({ type: "resize", cols: terminal.cols, rows: terminal.rows });
           terminal.focus();
           return;
         }
         if (message.type === "exit") {
+          window.clearTimeout(readyTimer);
           readyRef.current = false;
           lastEventRef.current = "exit";
           setPhase("disconnected");
@@ -323,6 +389,7 @@ export function TerminalPane({
           return;
         }
 
+        window.clearTimeout(readyTimer);
         readyRef.current = false;
         lastEventRef.current = "error";
         const busy = looksOccupied(message.message);
@@ -354,7 +421,7 @@ export function TerminalPane({
       }
       socketRef.current = null;
       readyRef.current = false;
-
+      window.clearTimeout(readyTimer);
       if (manualCloseRef.current) {
         manualCloseRef.current = false;
         setPhase("disconnected");
@@ -388,6 +455,8 @@ export function TerminalPane({
 
     return () => {
       connectionSeqRef.current += 1;
+      window.clearTimeout(readyTimer);
+      pendingInputRef.current = [];
       const current = socketRef.current;
       socketRef.current = null;
       readyRef.current = false;
@@ -444,7 +513,7 @@ export function TerminalPane({
             <span className="signal-lamp" aria-hidden="true" />
             {phaseLabel(phase)}
           </span>
-          <button className="text-button" type="button" onClick={() => reconnect(false)}>
+          <button className="text-button" type="button" onClick={() => reconnect(true)}>
             Reconnect
           </button>
           <button
@@ -467,7 +536,7 @@ export function TerminalPane({
               <p>{detail}</p>
             </div>
             <div className="link-actions">
-              <button className="button button-quiet button-small" type="button" onClick={() => reconnect(false)}>
+              <button className="button button-quiet button-small" type="button" onClick={() => reconnect(true)}>
                 {phase === "connecting" ? "Retry" : "Reconnect"}
               </button>
               {showForce ? (

@@ -14,11 +14,16 @@ export function TokenGate({ reason, canCancel, onCancel, onSubmit }: TokenGatePr
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!token) {
+    const trimmed = token.trim();
+    if (!trimmed) {
       setError("Enter the token shown for this smw instance.");
       return;
     }
-    onSubmit(token);
+    if (/[\u0000-\u001f\u007f]/.test(trimmed)) {
+      setError("The token contains invalid control characters.");
+      return;
+    }
+    onSubmit(trimmed);
   };
 
   return (
@@ -47,7 +52,8 @@ export function TokenGate({ reason, canCancel, onCancel, onSubmit }: TokenGatePr
           data-autofocus
         />
         <p className="field-hint">
-          The token is kept in this browser only and sent as an Authorization header.
+          Kept in this browser only. API requests use an Authorization header; the terminal
+          connection passes it as a query parameter, so avoid logging that URL.
         </p>
         {error ? (
           <p className="form-error" role="alert">

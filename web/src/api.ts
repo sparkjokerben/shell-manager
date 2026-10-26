@@ -200,7 +200,7 @@ function clampDimension(value: number): number {
   if (!Number.isFinite(value)) {
     return 80;
   }
-  return Math.min(65535, Math.max(1, Math.floor(value)));
+  return Math.min(1000, Math.max(1, Math.floor(value)));
 }
 
 export function buildWebSocketUrl(

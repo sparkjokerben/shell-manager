@@ -27,6 +27,13 @@ export function Dialog({
   className = "",
 }: DialogProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+
+  // App callbacks are often inline, so keep the latest one in a ref. The focus
+  // setup below must not re-run (and steal focus) on every parent render.
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
 
   useEffect(() => {
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -35,16 +42,19 @@ export function Dialog({
       return;
     }
 
-    const initial = panel.querySelector<HTMLElement>("[data-autofocus]") ?? focusableElements(panel)[0];
-    initial?.focus();
+    const initial =
+      panel.querySelector<HTMLElement>("[data-autofocus]") ??
+      focusableElements(panel)[0] ??
+      panel;
+    initial.focus();
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!panel.contains(document.activeElement)) {
         return;
       }
-      if (event.key === "Escape" && onClose) {
+      if (event.key === "Escape" && onCloseRef.current) {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (event.key !== "Tab") {
@@ -72,7 +82,7 @@ export function Dialog({
       document.removeEventListener("keydown", handleKeyDown);
       previous?.focus();
     };
-  }, [onClose]);
+  }, []);
 
   return (
     <div className="dialog-backdrop">
@@ -83,6 +93,7 @@ export function Dialog({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={description ? `${titleId}-description` : undefined}
+        tabIndex={-1}
       >
         <div className="dialog-rule" aria-hidden="true" />
         <div className="dialog-heading">

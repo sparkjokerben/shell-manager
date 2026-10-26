@@ -11,6 +11,7 @@ interface SidebarProps {
   error: string | null;
   hasToken: boolean;
   tokenRequired: boolean;
+  tokenKnown: boolean;
   open: boolean;
   onClose: () => void;
   onRefresh: () => void;
@@ -51,6 +52,7 @@ export function Sidebar({
   error,
   hasToken,
   tokenRequired,
+  tokenKnown,
   open,
   onClose,
   onRefresh,
@@ -167,7 +169,13 @@ export function Sidebar({
         <div className="token-state">
           <span className="token-label">Access token</span>
           <span className="token-copy">
-            {hasToken ? "Stored in this browser" : tokenRequired ? "Required by this instance" : "Not required"}
+            {hasToken
+              ? "Stored in this browser"
+              : !tokenKnown
+                ? "Checking this instance…"
+                : tokenRequired
+                  ? "Required by this instance"
+                  : "Not required"}
           </span>
         </div>
         {hasToken ? (
