@@ -1,11 +1,11 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// IPC control pipe path shared between sd client and shell-daemon.
-pub const CONTROL_PIPE: &str = r"\\.\pipe\shell-daemon\control";
+/// IPC control pipe path shared between the sp client and spd.
+pub const CONTROL_PIPE: &str = r"\\.\pipe\shell-persistence\control";
 
-/// Data pipe prefix: \\.\pipe\shell-daemon\data\<session_id>
-pub const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-daemon\data";
+/// Data pipe prefix: \\.\pipe\shell-persistence\data\<session_id>
+pub const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-persistence\data";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,7 +100,7 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
     let h = match h {
         Ok(h) => h,
         Err(_) => {
-            anyhow::bail!("failed to connect to control pipe (is shell-daemon running?)");
+            anyhow::bail!("failed to connect to control pipe (is spd running?)");
         }
     };
 

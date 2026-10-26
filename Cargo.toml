@@ -1,15 +1,21 @@
 [package]
-name = "shell-daemon"
+name = "shell-persistence"
 version = "0.1.0"
 edition = "2021"
+description = "Persistent Windows shells that survive SSH disconnects (ConPTY + named pipes)"
+license = "MIT"
+repository = "https://github.com/sparkjokerben/shell-persistence"
+readme = "README.md"
+keywords = ["windows", "conpty", "terminal", "ssh", "persistence"]
+categories = ["command-line-utilities"]
 
 [[bin]]
-name = "sd"
-path = "src/main_sd.rs"
+name = "sp"
+path = "src/main_sp.rs"
 
 [[bin]]
-name = "shell-daemon"
-path = "src/main_daemon.rs"
+name = "spd"
+path = "src/main_spd.rs"
 
 [dependencies]
 windows = { version = "0.52", features = [

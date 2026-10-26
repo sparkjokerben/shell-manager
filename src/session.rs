@@ -29,7 +29,7 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{COORD, ResizePseudoConsole};
 
-const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-daemon\data";
+const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-persistence\data";
 
 /// State of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -673,7 +673,8 @@ mod tests {
     }
 
     /// Detaching while output is flowing must disconnect the client promptly and
-    /// leave the shell alive and reattachable.    #[test]
+    /// leave the shell alive and reattachable.
+    #[test]
     fn detach_under_load_keeps_shell() {
         let session = Session::new("unit-detach", 80, 25, "cmd.exe").unwrap();
         session.start_data_pipe_listener().unwrap();

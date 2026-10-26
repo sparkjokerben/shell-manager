@@ -19,8 +19,8 @@ use windows::Win32::System::Console::{
     ENABLE_PROCESSED_OUTPUT, DISABLE_NEWLINE_AUTO_RETURN,
 };
 use windows::core::PCWSTR;
-use shell_daemon::protocol::{self, Request, Op};
-use shell_daemon::session::{for_each_mouse_mode, mouse_bit};
+use shell_persistence::protocol::{self, Request, Op};
+use shell_persistence::session::{for_each_mouse_mode, mouse_bit};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -260,9 +260,9 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 
 /// Bumped whenever the client's input handling changes, so a stale attach is
 /// easy to spot in the banner.
-const CLIENT_BUILD: &str = "client 2026-10-26d";
+const CLIENT_BUILD: &str = "client 2026-10-26e";
 
-/// Appends a diagnostic line to %TEMP%\sd-client.log.
+/// Appends a diagnostic line to %TEMP%\sp-client.log.
 ///
 /// Always on and best-effort: it records what the client actually received, so
 /// input problems can be diagnosed without reproducing them interactively.
@@ -272,7 +272,7 @@ fn client_log(msg: &str) {
 
     static LOG: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
     let slot = LOG.get_or_init(|| {
-        let path = std::env::temp_dir().join("sd-client.log");
+        let path = std::env::temp_dir().join("sp-client.log");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
