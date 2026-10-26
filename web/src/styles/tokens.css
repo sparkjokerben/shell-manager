@@ -1,0 +1,34 @@
+:root {
+  /* Petrol console palette: six core values, with a few tonal derivations. */
+  --petrol: #18282b;
+  --slate: #21363a;
+  --parchment: #e7e1d2;
+  --brass: #d3a84e;
+  --oxide: #c3654d;
+  --ice: #8bb7be;
+
+  --petrol-deep: #102023;
+  --petrol-soft: #1c2e31;
+  --slate-raised: #294246;
+  --ink-soft: #c5cfc8;
+  --muted: #91a5a0;
+  --muted-deep: #88a09b;
+  --line: #314a4e;
+  --line-soft: #273f43;
+  --line-strong: #496468;
+  --brass-soft: rgba(211, 168, 78, 0.14);
+  --brass-faint: rgba(211, 168, 78, 0.07);
+  --oxide-soft: rgba(195, 101, 77, 0.14);
+  --oxide-text: #dd8a73;
+  --ice-soft: rgba(139, 183, 190, 0.12);
+  --scrim: rgba(7, 15, 17, 0.72);
+
+  --font-display: Bahnschrift, "Aptos Display", "Segoe UI Variable Display", "Segoe UI", sans-serif;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+
+  --masthead-h: 64px;
+  --sidebar-w: 304px;
+  --radius: 2px;
+  --focus-ring: 2px solid var(--ice);
+}
