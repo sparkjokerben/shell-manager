@@ -81,10 +81,12 @@ impl Pty {
         }
 
         // Output pipe: PTY writes to output_write, parent reads from output_read.
+        // A larger buffer gives a detached session more headroom before the
+        // hosted program blocks on output the daemon is not draining.
         let mut output_read: HANDLE = unsafe { mem::zeroed() };
         let mut output_write: HANDLE = unsafe { mem::zeroed() };
         unsafe {
-            CreatePipe(&mut output_read, &mut output_write, None, 64 * 1024)
+            CreatePipe(&mut output_read, &mut output_write, None, 1024 * 1024)
                 .context("CreatePipe (output) failed")?;
         }
 

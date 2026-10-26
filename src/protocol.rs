@@ -15,6 +15,7 @@ pub enum Op {
     List,
     Stop,
     Resize,
+    Detach,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

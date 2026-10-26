@@ -144,6 +144,7 @@ fn dispatch(req: &Request, sessions: &SessionTable) -> Response {
         Op::List => handle_list(sessions),
         Op::Stop => handle_stop(&req.name, sessions),
         Op::Resize => handle_resize(&req.name, req.cols, req.rows, sessions),
+        Op::Detach => handle_detach(&req.name, sessions),
     }
 }
 
@@ -298,6 +299,27 @@ fn handle_list(sessions: &SessionTable) -> Response {
         .collect();
 
     Response::ok(Some(serde_json::to_value(infos).unwrap()))
+}
+
+/// Disconnect the attached client without stopping the session.
+fn handle_detach(name: &str, sessions: &SessionTable) -> Response {
+    {
+        let table = sessions.lock().unwrap();
+        match table.get(name) {
+            None => return Response::err(format!("session '{}' not found", name)),
+            Some(session) => {
+                if session.is_alive() {
+                    session.detach_client();
+                    return Response::ok(None);
+                }
+            }
+        }
+    }
+
+    // Mirror CONTINUE: a dead shell cannot be reattached, so reap it.
+    let removed = { sessions.lock().unwrap().remove(name) };
+    drop(removed);
+    Response::err(format!("session '{}' has exited", name))
 }
 
 fn handle_stop(name: &str, sessions: &SessionTable) -> Response {

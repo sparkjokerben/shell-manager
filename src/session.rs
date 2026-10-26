@@ -49,6 +49,8 @@ pub struct Session {
     pub stop_flag: Arc<AtomicBool>,
     /// True while a client is believed to be attached.
     pub client_connected: Arc<AtomicBool>,
+    /// Set by an out-of-band detach request; both forwarder threads watch it.
+    pub detach_requested: Arc<AtomicBool>,
     /// Win32 thread ids of the out/in threads (for cancelling blocking I/O).
     pub out_tid: Arc<Mutex<Option<u32>>>,
     pub in_tid: Arc<Mutex<Option<u32>>>,
@@ -67,6 +69,7 @@ impl Session {
             state: Arc::new(Mutex::new(SessionState::Created)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             client_connected: Arc::new(AtomicBool::new(false)),
+            detach_requested: Arc::new(AtomicBool::new(false)),
             out_tid: Arc::new(Mutex::new(None)),
             in_tid: Arc::new(Mutex::new(None)),
         })
@@ -99,6 +102,8 @@ impl Session {
         let alive_in = self.client_connected.clone();
         let out_tid = self.out_tid.clone();
         let in_tid = self.in_tid.clone();
+        let detach_out = self.detach_requested.clone();
+        let detach_in = self.detach_requested.clone();
 
         // In thread (client -> PTY).
         let in_tid_slot = in_tid.clone();
@@ -106,14 +111,14 @@ impl Session {
         thread::spawn(move || {
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             *in_tid_slot.lock().unwrap() = Some(tid);
-            run_in_thread(in_h, pty_in, state_in, stop_in_thread, alive_in);
+            run_in_thread(in_h, pty_in, state_in, stop_in_thread, alive_in, detach_in);
         });
 
         // Out thread (PTY -> client).
         thread::spawn(move || {
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             *out_tid.lock().unwrap() = Some(tid);
-            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out);
+            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out);
         });
 
         Ok(())
@@ -140,6 +145,39 @@ impl Session {
         cancel_thread_io(ot);
         cancel_thread_io(it);
         Ok(())
+    }
+
+    /// Disconnect the attached client without stopping the session.
+    ///
+    /// The actual cancellation runs on a helper thread: CancelSynchronousIo can
+    /// block, and callers may hold the session table lock.
+    pub fn detach_client(&self) {
+        if !self.client_connected.load(Ordering::Relaxed) {
+            return;
+        }
+
+        self.detach_requested.store(true, Ordering::Relaxed);
+
+        let in_tid = self.in_tid.clone();
+        let out_tid = self.out_tid.clone();
+        let connected = self.client_connected.clone();
+        let requested = self.detach_requested.clone();
+
+        thread::spawn(move || {
+            // Retry until the client is gone: a single cancel can miss when the
+            // target thread is between blocking calls. A fresh attach clears the
+            // request flag, which also stops this loop.
+            for _ in 0..50 {
+                if !connected.load(Ordering::Relaxed) || !requested.load(Ordering::Relaxed) {
+                    break;
+                }
+                let it = *in_tid.lock().unwrap();
+                let ot = *out_tid.lock().unwrap();
+                cancel_thread_io(it);
+                cancel_thread_io(ot);
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
     }
 }
 
@@ -189,6 +227,7 @@ fn run_in_thread(
     state: Arc<Mutex<SessionState>>,
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    detach: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -208,9 +247,13 @@ fn run_in_thread(
 
         set_attached(&state);
         alive.store(true, Ordering::Relaxed);
+        detach.store(false, Ordering::Relaxed);
 
-        // Read client input until the client disconnects.
+        // Read client input until the client disconnects or a detach is asked for.
         loop {
+            if stop.load(Ordering::Relaxed) || detach.load(Ordering::Relaxed) {
+                break;
+            }
             let mut read: u32 = 0;
             let result = unsafe {
                 ReadFile(server, Some(&mut buf), Some(&mut read), None)
@@ -244,6 +287,7 @@ fn run_out_thread(
     state: Arc<Mutex<SessionState>>,
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    detach: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -263,9 +307,15 @@ fn run_out_thread(
 
         set_attached(&state);
         alive.store(true, Ordering::Relaxed);
+        detach.store(false, Ordering::Relaxed);
 
         'forward: loop {
-            if stop.load(Ordering::Relaxed) {
+            // Checked on every iteration, including while output is flowing: a
+            // detach or client loss must disconnect even under constant load.
+            if stop.load(Ordering::Relaxed)
+                || detach.load(Ordering::Relaxed)
+                || !alive.load(Ordering::Relaxed)
+            {
                 break 'forward;
             }
 
@@ -337,5 +387,137 @@ fn set_detached(state: &Arc<Mutex<SessionState>>) {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_MODE, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+
+    fn open(path: &str, access: u32) -> HANDLE {
+        let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let r = unsafe {
+                CreateFileW(
+                    PCWSTR::from_raw(wide.as_ptr()),
+                    access,
+                    FILE_SHARE_MODE(0),
+                    None,
+                    OPEN_EXISTING,
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    None,
+                )
+            };
+            match r {
+                Ok(h) => return h,
+                Err(e) => {
+                    if Instant::now() > deadline {
+                        panic!("open {} failed: {}", path, e);
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    /// Ok(n) with n == 0 when nothing is available; Err when the pipe is closed.
+    fn read_some(h: HANDLE, buf: &mut [u8]) -> Result<usize, u32> {
+        let mut avail: u32 = 0;
+        unsafe {
+            PeekNamedPipe(h, None, 0, None, Some(&mut avail), None)
+                .map_err(|e| e.code().0 as u32)?;
+        }
+        if avail == 0 {
+            return Ok(0);
+        }
+        let want = (avail as usize).min(buf.len());
+        let mut read: u32 = 0;
+        unsafe {
+            ReadFile(h, Some(&mut buf[..want]), Some(&mut read), None)
+                .map_err(|e| e.code().0 as u32)?;
+        }
+        Ok(read as usize)
+    }
+
+    /// Detaching while output is flowing must disconnect the client promptly and
+    /// leave the shell alive and reattachable.
+    #[test]
+    fn detach_under_load_keeps_shell() {
+        let session = Session::new("unit-detach", 80, 25, "cmd.exe").unwrap();
+        session.start_data_pipe_listener().unwrap();
+        let (out_path, in_path) = session.data_pipe_paths();
+
+        let h_out = open(&out_path, GENERIC_READ.0);
+        let h_in = open(&in_path, GENERIC_WRITE.0);
+
+        // Keep the shell busy producing output.
+        let cmd = b"for /L %i in (1,1,1000000) do @echo LINE %i\r\n";
+        let mut written: u32 = 0;
+        unsafe { WriteFile(h_in, Some(cmd), Some(&mut written), None).unwrap() };
+
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut total = 0usize;
+        while Instant::now() < deadline && total < 4096 {
+            match read_some(h_out, &mut buf) {
+                Ok(n) => total += n,
+                Err(_) => panic!("out pipe broke before detach"),
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(total >= 4096, "expected output before detach");
+
+        session.detach_client();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut closed = false;
+        while Instant::now() < deadline {
+            match read_some(h_out, &mut buf) {
+                Ok(_) => {}
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(closed, "detach did not disconnect the client");
+        assert!(session.is_alive(), "shell exited during detach");
+
+        // A real client process exits here, closing both of its handles.
+        unsafe {
+            let _ = CloseHandle(h_out);
+            let _ = CloseHandle(h_in);
+        }
+
+        let h_out2 = open(&out_path, GENERIC_READ.0);
+        let h_in2 = open(&in_path, GENERIC_WRITE.0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = 0usize;
+        while Instant::now() < deadline && got == 0 {
+            match read_some(h_out2, &mut buf) {
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(got > 0, "no output after reattach");
+
+        unsafe {
+            let _ = CloseHandle(h_out2);
+            let _ = CloseHandle(h_in2);
+        }
+        session.stop().unwrap();
     }
 }

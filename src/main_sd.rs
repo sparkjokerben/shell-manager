@@ -1,5 +1,7 @@
 use std::os::windows::ffi::OsStrExt;
 use std::ffi::OsStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use anyhow::Result;
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -22,7 +24,7 @@ use shell_daemon::protocol::{self, Request, Op};
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: sd <start|continue|list|stop> <name> [--wsl]");
+        eprintln!("usage: sd <start|continue|detach|list|stop> <name> [--wsl]");
         std::process::exit(1);
     }
     match args[1].as_str() {
@@ -58,6 +60,22 @@ fn main() -> Result<()> {
             }
             let (pipe_out, pipe_in) = extract_pipes(&resp.data);
             attach(&name, &pipe_out, &pipe_in)
+        }
+        "detach" => {
+            if args.len() < 3 {
+                eprintln!("usage: sd detach <name>");
+                std::process::exit(1);
+            }
+            let name = args[2].clone();
+            let req = Request { op: Op::Detach, name, wsl: None, cols: None, rows: None };
+            let resp = protocol::pipe_request(protocol::CONTROL_PIPE, &req)?;
+            if resp.ok {
+                println!("detached");
+            } else {
+                eprintln!("detach failed: {}", resp.error);
+                std::process::exit(1);
+            }
+            Ok(())
         }
         "list" => {
             let req = Request { op: Op::List, name: String::new(), wsl: None, cols: None, rows: None };
@@ -367,9 +385,14 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
         });
     }
 
-    // The main thread will block reading the out pipe. Remember its id so the
-    // stdin thread can cancel that read when the user detaches with "~.".
-    let main_tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    // The reader thread blocks on the out pipe, so the stdin thread needs a way
+    // to cancel that read when the user detaches with "~.". It publishes its
+    // thread id and a done flag for that handshake.
+    let reader_done = Arc::new(AtomicBool::new(false));
+    let reader_tid = Arc::new(AtomicU32::new(0));
+
+    let stdin_done = reader_done.clone();
+    let stdin_reader_tid = reader_tid.clone();
 
     let stdin_thread = std::thread::spawn(move || -> Result<()> {
         let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
@@ -391,15 +414,34 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
                     let data = &buf[..read as usize];
                     let (forward, detach) = detector.feed(data);
                     if detach {
-                        // Unblock the main thread's ReadFile on the out pipe.
-                        // Retry in a loop: the main thread may not have posted its
-                        // read yet when the first cancellation is issued.
+                        // Forward whatever preceded the escape on this read
+                        // before tearing the connection down (ssh-like).
+                        if !forward.is_empty() {
+                            let _ = write_all(h_in, &forward);
+                        }
+                        // Unblock the reader thread's ReadFile on the out pipe.
+                        // Wait (bounded) for it to publish its thread id: it is
+                        // set first thing in the closure, but the thread may not
+                        // have been scheduled yet.
+                        let mut waited = 0u32;
+                        while stdin_reader_tid.load(Ordering::Relaxed) == 0 && waited < 100 {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            waited += 1;
+                        }
                         unsafe {
                             use windows::Win32::System::IO::CancelSynchronousIo;
                             use windows::Win32::System::Threading::{OpenThread, THREAD_TERMINATE};
-                            while let Ok(ht) = OpenThread(THREAD_TERMINATE, false, main_tid) {
-                                let _ = CancelSynchronousIo(ht);
-                                let _ = windows::Win32::Foundation::CloseHandle(ht);
+                            // Retry until the reader has finished: the first
+                            // cancellation may land before it posts its read.
+                            while !stdin_done.load(Ordering::Relaxed) {
+                                if let Ok(ht) = OpenThread(
+                                    THREAD_TERMINATE,
+                                    false,
+                                    stdin_reader_tid.load(Ordering::Relaxed),
+                                ) {
+                                    let _ = CancelSynchronousIo(ht);
+                                    let _ = windows::Win32::Foundation::CloseHandle(ht);
+                                }
                                 std::thread::sleep(std::time::Duration::from_millis(20));
                             }
                         }
@@ -415,50 +457,70 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
         Ok(())
     });
 
-    // Main thread: out pipe -> stdout.
-    let mut buf = [0u8; 4096];
-    let mut carry: Vec<u8> = Vec::new();
-    loop {
-        let mut read: u32 = 0;
-        let r = unsafe {
-            ReadFile(
-                h_out,
-                Some(&mut buf),
-                Some(&mut read),
-                None,
-            )
-        };
-        match r {
-            Ok(()) if read == 0 => break,
-            Ok(()) => {
-                let chunk = &buf[..read as usize];
-                let data = if has_console {
-                    // The console renders WriteFile bytes using its code page
-                    // (set to UTF-8 above). Hold back an incomplete trailing
-                    // UTF-8 sequence so multibyte characters split across reads
-                    // are not decoded as garbage.
-                    let mut joined = Vec::with_capacity(carry.len() + chunk.len());
-                    joined.extend_from_slice(&carry);
-                    joined.extend_from_slice(chunk);
-                    let valid = utf8_complete_len(&joined);
-                    carry.clear();
-                    carry.extend_from_slice(&joined[valid..]);
-                    joined[..valid].to_vec()
-                } else {
-                    chunk.to_vec()
-                };
-                if !data.is_empty() && !write_all(stdout, &data)? {
-                    break;
-                }
-            }
-            Err(_) => break,
+    // Reader thread: out pipe -> stdout. Keeping this off the main thread means
+    // the cancel above only ever targets the blocking ReadFile here, never a
+    // console write performed by the teardown path.
+    let reader = std::thread::spawn(move || {
+        unsafe {
+            reader_tid.store(
+                windows::Win32::System::Threading::GetCurrentThreadId(),
+                Ordering::Relaxed,
+            );
         }
-    }
+        let mut buf = [0u8; 4096];
+        let mut carry: Vec<u8> = Vec::new();
+        loop {
+            let mut read: u32 = 0;
+            let r = unsafe {
+                ReadFile(
+                    h_out,
+                    Some(&mut buf),
+                    Some(&mut read),
+                    None,
+                )
+            };
+            match r {
+                Ok(()) if read == 0 => break,
+                Ok(()) => {
+                    let chunk = &buf[..read as usize];
+                    let data = if has_console {
+                        // The console renders WriteFile bytes using its code page
+                        // (set to UTF-8 above). Hold back an incomplete trailing
+                        // UTF-8 sequence so multibyte characters split across reads
+                        // are not decoded as garbage.
+                        let mut joined = Vec::with_capacity(carry.len() + chunk.len());
+                        joined.extend_from_slice(&carry);
+                        joined.extend_from_slice(chunk);
+                        let valid = utf8_complete_len(&joined);
+                        carry.clear();
+                        carry.extend_from_slice(&joined[valid..]);
+                        joined[..valid].to_vec()
+                    } else {
+                        chunk.to_vec()
+                    };
+                    if !data.is_empty() {
+                        // A cancelled console write must only end this thread,
+                        // never panic the process.
+                        match write_all(stdout, &data) {
+                            Ok(true) => {}
+                            _ => break,
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        reader_done.store(true, Ordering::Relaxed);
+    });
+
+    let _ = reader.join();
 
     // Do NOT join the stdin thread: in raw mode it may be blocked in a console
     // read that never returns. Returning from main terminates the process.
     drop(stdin_thread);
-    println!("\r\ndetached");
+    // Plain write instead of println!: a console write racing with teardown must
+    // not panic the client with "failed printing to stdout".
+    let _ = write_all(stdout, b"\r\ndetached\r\n");
     Ok(())
 }
 
