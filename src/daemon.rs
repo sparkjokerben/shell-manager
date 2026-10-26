@@ -1,4 +1,4 @@
-//! Daemon: the long-running spd process.
+//! Daemon: the long-running smd process.
 //!
 //! Maintains a session table and serves control-pipe requests (START / CONTINUE / LIST / STOP).
 
@@ -24,7 +24,7 @@ pub struct Daemon {
     control_pipe: HANDLE,
 }
 
-const CONTROL_PIPE: &str = r"\\.\pipe\shell-persistence\control";
+const CONTROL_PIPE: &str = r"\\.\pipe\shell-manager\control";
 
 impl Daemon {
     pub fn new() -> Result<Self> {
@@ -61,7 +61,7 @@ impl Daemon {
     /// Connections are handled serially: each request is short-lived
     /// (START/CONTINUE/LIST/STOP), so no per-connection thread is needed.
     pub fn run(&mut self) -> Result<()> {
-        println!("spd listening on {}", CONTROL_PIPE);
+        println!("smd listening on {}", CONTROL_PIPE);
 
         loop {
             let connected = unsafe { crate::protocol::is_pipe_connected(&ConnectNamedPipe(self.control_pipe, None)) };

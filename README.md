@@ -1,17 +1,17 @@
-# shell-persistence
+# shell-manager
 
 Persistent Windows shells that survive SSH disconnects.
 
 [中文说明](README.zh-CN.md)
 
-[![ci](https://github.com/sparkjokerben/shell-persistence/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkjokerben/shell-persistence/actions/workflows/ci.yml)
-[![release](https://github.com/sparkjokerben/shell-persistence/actions/workflows/release.yml/badge.svg)](https://github.com/sparkjokerben/shell-persistence/releases)
+[![ci](https://github.com/sparkjokerben/shell-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkjokerben/shell-manager/actions/workflows/ci.yml)
+[![release](https://github.com/sparkjokerben/shell-manager/actions/workflows/release.yml/badge.svg)](https://github.com/sparkjokerben/shell-manager/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`sp` is the client you type into; `spd` is a small background daemon. The daemon
+`sm` is the client you type into; `smd` is a small background daemon. The daemon
 owns a shell hosted in a Windows pseudo console (ConPTY). Close the SSH window,
 lose the connection, or detach on purpose - the shell keeps running. Reconnect
-and `sp continue <name>` puts you back in front of the same shell, with its
+and `sm continue <name>` puts you back in front of the same shell, with its
 scrollback, running programs and working directory intact.
 
 The hosted shell is not modified in any way: `pwsh.exe` / `wsl.exe` start exactly
@@ -31,42 +31,42 @@ sessions cannot host PowerShell or anything that needs the Windows desktop.
 
 ## Install
 
-Download `shell-persistence-vX.Y.Z-x64.zip` from
-[Releases](https://github.com/sparkjokerben/shell-persistence/releases), then
-put `sp.exe` and `spd.exe` somewhere on `PATH` (for example `%USERPROFILE%\bin`).
+Download `shell-manager-vX.Y.Z-x64.zip` from
+[Releases](https://github.com/sparkjokerben/shell-manager/releases), then
+put `sm.exe` and `smd.exe` somewhere on `PATH` (for example `%USERPROFILE%\bin`).
 
 Start the daemon in your interactive desktop session - it must live there,
 because ConPTY children inherit its session and only the interactive desktop can
 host GUI windows:
 
 ```powershell
-schtasks /create /tn spd /tr "wscript.exe \"$env:USERPROFILE\bin\spd-launch.vbs\"" /sc onlogon /it /f
-schtasks /run /tn spd
+schtasks /create /tn smd /tr "wscript.exe \"$env:USERPROFILE\bin\smd-launch.vbs\"" /sc onlogon /it /f
+schtasks /run /tn smd
 ```
 
-Simpler alternative: place a shortcut to `spd.exe` in `shell:startup`.
+Simpler alternative: place a shortcut to `smd.exe` in `shell:startup`.
 
 Building from source installs both binaries and registers the logon task:
 
 ```powershell
-git clone https://github.com/sparkjokerben/shell-persistence
-cd shell-persistence
+git clone https://github.com/sparkjokerben/shell-manager
+cd shell-manager
 .\deploy.ps1
 ```
 
 ## Usage
 
 ```text
-sp start <name>            # create a session and attach to it
-sp start <name> --wsl      # host wsl.exe instead of PowerShell
-sp continue <name>         # reattach to an existing session
-sp list                    # sessions and their attach state
-sp detach <name>           # disconnect the attached client, keep the shell
-sp stop <name>             # destroy the session and its shell
+sm start <name>            # create a session and attach to it
+sm start <name> --wsl      # host wsl.exe instead of PowerShell
+sm continue <name>         # reattach to an existing session
+sm list                    # sessions and their attach state
+sm detach <name>           # disconnect the attached client, keep the shell
+sm stop <name>             # destroy the session and its shell
 ```
 
 Detach from inside an attached shell with `Ctrl+]` or `F12`; the session keeps
-running in the background. `sp detach <name>` does the same from another window
+running in the background. `sm detach <name>` does the same from another window
 and works no matter what the attached client is doing.
 
 If a command is running while you detach (a build, a test suite, a TUI such as
@@ -77,12 +77,12 @@ whole screen.
 ## How it works
 
 ```text
-terminal ── sp.exe ──┬── control pipe ──┐
+terminal ── sm.exe ──┬── control pipe ──┐
                      └── data pipes ────┤
-                                        spd.exe ── ConPTY ── pwsh.exe / wsl.exe
+                                        smd.exe ── ConPTY ── pwsh.exe / wsl.exe
 ```
 
-- `spd` keeps a table of sessions. Each session owns a ConPTY, the shell process
+- `smd` keeps a table of sessions. Each session owns a ConPTY, the shell process
   and two unidirectional named pipes (`out`, `in`) for the attached client.
 - While no client is attached, a drain thread keeps reading the PTY output, so a
   program writing to the console never blocks.
@@ -95,7 +95,7 @@ terminal ── sp.exe ──┬── control pipe ──┐
 ## Limitations
 
 - **The daemon lives in your interactive session.** Logging off (or rebooting)
-  ends `spd` and every session it hosts. SSH disconnects are unaffected.
+  ends `smd` and every session it hosts. SSH disconnects are unaffected.
 - **GUI work needs that desktop session.** Electron apps, screen automation and
   anything else that touches a window only work because hosted shells live in
   the interactive session.
@@ -113,8 +113,8 @@ terminal ── sp.exe ──┬── control pipe ──┐
 
 ## Debugging
 
-- `%TEMP%\spd.log` - daemon start, resolved shell, per-session start results.
-- `%TEMP%\sp-client.log` - client build id, console modes, raw stdin bytes and
+- `%TEMP%\smd.log` - daemon start, resolved shell, per-session start results.
+- `%TEMP%\sm-client.log` - client build id, console modes, raw stdin bytes and
   detach decisions.
 
 ## License

@@ -1,11 +1,11 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// IPC control pipe path shared between the sp client and spd.
-pub const CONTROL_PIPE: &str = r"\\.\pipe\shell-persistence\control";
+/// IPC control pipe path shared between the sm client and smd.
+pub const CONTROL_PIPE: &str = r"\\.\pipe\shell-manager\control";
 
-/// Data pipe prefix: \\.\pipe\shell-persistence\data\<session_id>
-pub const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-persistence\data";
+/// Data pipe prefix: \\.\pipe\shell-manager\data\<session_id>
+pub const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-manager\data";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,7 +100,7 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
     let h = match h {
         Ok(h) => h,
         Err(_) => {
-            anyhow::bail!("failed to connect to control pipe (is spd running?)");
+            anyhow::bail!("failed to connect to control pipe (is smd running?)");
         }
     };
 

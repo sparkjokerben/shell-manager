@@ -1,16 +1,16 @@
-# shell-persistence
+# shell-manager
 
 让 Windows 上的 shell 熬过 SSH 断线的持久终端。
 
 [English](README.md)
 
-[![ci](https://github.com/sparkjokerben/shell-persistence/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkjokerben/shell-persistence/actions/workflows/ci.yml)
-[![release](https://github.com/sparkjokerben/shell-persistence/actions/workflows/release.yml/badge.svg)](https://github.com/sparkjokerben/shell-persistence/releases)
+[![ci](https://github.com/sparkjokerben/shell-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkjokerben/shell-manager/actions/workflows/ci.yml)
+[![release](https://github.com/sparkjokerben/shell-manager/actions/workflows/release.yml/badge.svg)](https://github.com/sparkjokerben/shell-manager/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`sp` 是你敲命令的客户端，`spd` 是常驻后台的小守护进程。守护进程持有一个由
+`sm` 是你敲命令的客户端，`smd` 是常驻后台的小守护进程。守护进程持有一个由
 Windows 伪终端（ConPTY）托管的 shell：关掉 SSH 窗口、网络断开，或者主动脱附，
-shell 都继续跑；重新连上后 `sp continue <名字>` 就回到同一个 shell，回滚缓冲、
+shell 都继续跑；重新连上后 `sm continue <名字>` 就回到同一个 shell，回滚缓冲、
 正在运行的程序、工作目录全都还在。
 
 被托管的 shell 完全没有被改动：`pwsh.exe` / `wsl.exe` 照常启动，并使用你自己的
@@ -29,41 +29,41 @@ shell 都继续跑；重新连上后 `sp continue <名字>` 就回到同一个 s
 
 ## 安装
 
-从 [Releases](https://github.com/sparkjokerben/shell-persistence/releases) 下载
-`shell-persistence-vX.Y.Z-x64.zip`，把 `sp.exe` 与 `spd.exe` 放到 `PATH` 里的目录
+从 [Releases](https://github.com/sparkjokerben/shell-manager/releases) 下载
+`shell-manager-vX.Y.Z-x64.zip`，把 `sm.exe` 与 `smd.exe` 放到 `PATH` 里的目录
 （例如 `%USERPROFILE%\bin`）。
 
 守护进程必须运行在**交互桌面会话**里——ConPTY 的子进程继承守护进程的会话，而且
 只有交互桌面才能承载 GUI 窗口：
 
 ```powershell
-schtasks /create /tn spd /tr "wscript.exe \"$env:USERPROFILE\bin\spd-launch.vbs\"" /sc onlogon /it /f
-schtasks /run /tn spd
+schtasks /create /tn smd /tr "wscript.exe \"$env:USERPROFILE\bin\smd-launch.vbs\"" /sc onlogon /it /f
+schtasks /run /tn smd
 ```
 
-更简单的做法：把 `spd.exe` 的快捷方式放进 `shell:startup`。
+更简单的做法：把 `smd.exe` 的快捷方式放进 `shell:startup`。
 
 从源码构建会同时安装两个可执行文件并注册登录任务：
 
 ```powershell
-git clone https://github.com/sparkjokerben/shell-persistence
-cd shell-persistence
+git clone https://github.com/sparkjokerben/shell-manager
+cd shell-manager
 .\deploy.ps1
 ```
 
 ## 用法
 
 ```text
-sp start <名字>            # 新建会话并附着
-sp start <名字> --wsl      # 托管 wsl.exe 而不是 PowerShell
-sp continue <名字>         # 重新附着一个已有会话
-sp list                    # 列出会话与附着状态
-sp detach <名字>           # 断开当前客户端，shell 保持运行
-sp stop <名字>             # 销毁会话及其 shell
+sm start <名字>            # 新建会话并附着
+sm start <名字> --wsl      # 托管 wsl.exe 而不是 PowerShell
+sm continue <名字>         # 重新附着一个已有会话
+sm list                    # 列出会话与附着状态
+sm detach <名字>           # 断开当前客户端，shell 保持运行
+sm stop <名字>             # 销毁会话及其 shell
 ```
 
 在附着的 shell 里按 `Ctrl+]` 或 `F12` 脱附，会话继续在后台运行；在另一个窗口里
-执行 `sp detach <名字>` 效果相同，且不受附着客户端当前状态影响。
+执行 `sm detach <名字>` 效果相同，且不受附着客户端当前状态影响。
 
 脱附时如果有程序正在运行（编译、测试、Claude Code 这类 TUI），它不会中断：守护
 进程在没有客户端时仍持续排空伪终端输出，程序不会因为输出管道写满而卡死；重新
@@ -72,12 +72,12 @@ sp stop <名字>             # 销毁会话及其 shell
 ## 工作原理
 
 ```text
-终端 ── sp.exe ──┬── 控制管道 ──┐
+终端 ── sm.exe ──┬── 控制管道 ──┐
                  └── 数据管道 ──┤
-                                spd.exe ── ConPTY ── pwsh.exe / wsl.exe
+                                smd.exe ── ConPTY ── pwsh.exe / wsl.exe
 ```
 
-- `spd` 维护会话表，每个会话持有一个 ConPTY、shell 进程，以及两条单向命名管道
+- `smd` 维护会话表，每个会话持有一个 ConPTY、shell 进程，以及两条单向命名管道
   （`out`、`in`）供附着的客户端使用。
 - 没有客户端附着时，排空线程持续读取伪终端输出，保证程序不会因管道写满而阻塞。
 - 重新附着时客户端把伪终端高度先减一、再恢复，触发应用整屏重绘。
@@ -87,7 +87,7 @@ sp stop <名字>             # 销毁会话及其 shell
 
 ## 已知限制
 
-- **守护进程运行在你的交互会话里。** 注销或重启会结束 `spd` 和它托管的所有会话；
+- **守护进程运行在你的交互会话里。** 注销或重启会结束 `smd` 和它托管的所有会话；
   SSH 断线不受影响。
 - **GUI 相关的工作依赖那个桌面会话。** Electron 应用、屏幕自动化等能正常工作，
   正是因为宿主 shell 在交互会话中。
@@ -102,8 +102,8 @@ sp stop <名字>             # 销毁会话及其 shell
 
 ## 排查
 
-- `%TEMP%\spd.log`——守护进程启动、选中的 shell、每次建会话的结果
-- `%TEMP%\sp-client.log`——客户端构建号、控制台模式、stdin 原始字节与脱附判定
+- `%TEMP%\smd.log`——守护进程启动、选中的 shell、每次建会话的结果
+- `%TEMP%\sm-client.log`——客户端构建号、控制台模式、stdin 原始字节与脱附判定
 
 ## 许可证
 

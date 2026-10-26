@@ -1,21 +1,21 @@
 [package]
-name = "shell-persistence"
+name = "shell-manager"
 version = "0.1.0"
 edition = "2021"
 description = "Persistent Windows shells that survive SSH disconnects (ConPTY + named pipes)"
 license = "MIT"
-repository = "https://github.com/sparkjokerben/shell-persistence"
+repository = "https://github.com/sparkjokerben/shell-manager"
 readme = "README.md"
 keywords = ["windows", "conpty", "terminal", "ssh", "persistence"]
 categories = ["command-line-utilities"]
 
 [[bin]]
-name = "sp"
-path = "src/main_sp.rs"
+name = "sm"
+path = "src/main_sm.rs"
 
 [[bin]]
-name = "spd"
-path = "src/main_spd.rs"
+name = "smd"
+path = "src/main_smd.rs"
 
 [dependencies]
 windows = { version = "0.52", features = [

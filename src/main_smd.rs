@@ -1,4 +1,4 @@
-use shell_persistence::daemon::Daemon;
+use shell_manager::daemon::Daemon;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -34,17 +34,17 @@ fn try_mutex(name: &str) -> anyhow::Result<Option<HANDLE>> {
 /// lives in session 0 while the desktop is session 1 - and a `Local\` name
 /// (per-session) let a second instance coexist and steal client requests.
 fn acquire_single_instance() -> anyhow::Result<HANDLE> {
-    match try_mutex(r"Global\spd-single-instance") {
+    match try_mutex(r"Global\smd-single-instance") {
         Ok(Some(h)) => return Ok(h),
-        Ok(None) => anyhow::bail!("another spd instance is already running"),
+        Ok(None) => anyhow::bail!("another smd instance is already running"),
         // Creating a Global\ kernel object needs SeCreateGlobalPrivilege, which
         // an unelevated logon session may lack; fall back to the per-session name.
         Err(_) => {}
     }
 
-    match try_mutex(r"Local\spd-single-instance")? {
+    match try_mutex(r"Local\smd-single-instance")? {
         Some(h) => Ok(h),
-        None => anyhow::bail!("another spd instance is already running"),
+        None => anyhow::bail!("another smd instance is already running"),
     }
 }
 
@@ -61,13 +61,13 @@ fn main() -> anyhow::Result<()> {
     let _mutex = match acquire_single_instance() {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("spd: {}", e);
+            eprintln!("smd: {}", e);
             return Ok(());
         }
     };
 
-    let shell = shell_persistence::shell::default_shell();
-    shell_persistence::log::info(&format!(
+    let shell = shell_manager::shell::default_shell();
+    shell_manager::log::info(&format!(
         "daemon start pid={} session={} shell={}",
         std::process::id(),
         current_session(),
@@ -75,13 +75,13 @@ fn main() -> anyhow::Result<()> {
     ));
 
     ctrlc::set_handler(move || {
-        println!("\nspd shutting down...");
+        println!("\nsmd shutting down...");
         std::process::exit(0);
     })
     .expect("error setting Ctrl-C handler");
 
     let mut daemon = Daemon::new()?;
-    println!("spd started (session {}, shell {}).", current_session(), shell);
+    println!("smd started (session {}, shell {}).", current_session(), shell);
     daemon.run()?;
     Ok(())
 }

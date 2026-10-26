@@ -25,11 +25,11 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          $name = "shell-persistence-$tag-x64"
+          $name = "shell-manager-$tag-x64"
           New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/sp.exe    dist/
-          Copy-Item target/release/spd.exe   dist/
-          Copy-Item README.md, README.zh-CN.md, LICENSE, spd-launch.vbs dist/
+          Copy-Item target/release/sm.exe    dist/
+          Copy-Item target/release/smd.exe   dist/
+          Copy-Item README.md, README.zh-CN.md, LICENSE, smd-launch.vbs dist/
           Compress-Archive -Path dist/* -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Set-Content SHA256SUMS.txt -Encoding ascii
@@ -38,6 +38,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            shell-persistence-*-x64.zip
+            shell-manager-*-x64.zip
             SHA256SUMS.txt
           generate_release_notes: true

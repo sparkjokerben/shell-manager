@@ -1,4 +1,4 @@
-use shell_persistence::pty::Pty;
+use shell_manager::pty::Pty;
 use std::time::{Duration, Instant};
 
 /// ConPTY must forward the sequences TUI apps rely on: 24-bit color and

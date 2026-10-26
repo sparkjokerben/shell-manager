@@ -19,19 +19,19 @@ use windows::Win32::System::Console::{
     ENABLE_PROCESSED_OUTPUT, DISABLE_NEWLINE_AUTO_RETURN,
 };
 use windows::core::PCWSTR;
-use shell_persistence::protocol::{self, Request, Op};
-use shell_persistence::session::{for_each_mouse_mode, mouse_bit};
+use shell_manager::protocol::{self, Request, Op};
+use shell_manager::session::{for_each_mouse_mode, mouse_bit};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: sp <start|continue|detach|list|stop> <name> [--wsl]");
+        eprintln!("usage: sm <start|continue|detach|list|stop> <name> [--wsl]");
         std::process::exit(1);
     }
     match args[1].as_str() {
         "start" => {
             if args.len() < 3 {
-                eprintln!("usage: sp start <name> [--wsl]");
+                eprintln!("usage: sm start <name> [--wsl]");
                 std::process::exit(1);
             }
             let name = args[2].clone();
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
         }
         "continue" => {
             if args.len() < 3 {
-                eprintln!("usage: sp continue <name>");
+                eprintln!("usage: sm continue <name>");
                 std::process::exit(1);
             }
             let name = args[2].clone();
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
         }
         "detach" => {
             if args.len() < 3 {
-                eprintln!("usage: sp detach <name>");
+                eprintln!("usage: sm detach <name>");
                 std::process::exit(1);
             }
             let name = args[2].clone();
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
         }
         "stop" => {
             if args.len() < 3 {
-                eprintln!("usage: sp stop <name>");
+                eprintln!("usage: sm stop <name>");
                 std::process::exit(1);
             }
             let name = args[2].clone();
@@ -260,9 +260,9 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 
 /// Bumped whenever the client's input handling changes, so a stale attach is
 /// easy to spot in the banner.
-const CLIENT_BUILD: &str = "client 2026-10-26e";
+const CLIENT_BUILD: &str = "client 2026-10-26f";
 
-/// Appends a diagnostic line to %TEMP%\sp-client.log.
+/// Appends a diagnostic line to %TEMP%\sm-client.log.
 ///
 /// Always on and best-effort: it records what the client actually received, so
 /// input problems can be diagnosed without reproducing them interactively.
@@ -272,7 +272,7 @@ fn client_log(msg: &str) {
 
     static LOG: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
     let slot = LOG.get_or_init(|| {
-        let path = std::env::temp_dir().join("sp-client.log");
+        let path = std::env::temp_dir().join("sm-client.log");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -622,7 +622,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
             let _ = SetConsoleOutputCP(65001);
         }
     } else {
-        eprintln!("[sp] no console detected; forwarding without raw mode");
+        eprintln!("[sm] no console detected; forwarding without raw mode");
     }
 
     // Attaching silently keeps a running TUI's screen intact: any line printed

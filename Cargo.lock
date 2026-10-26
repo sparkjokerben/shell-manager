@@ -241,7 +241,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "shell-persistence"
+name = "shell-manager"
 version = "0.1.0"
 dependencies = [
  "anyhow",
