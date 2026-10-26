@@ -154,6 +154,16 @@ fn handle_start(
     rows: Option<u16>,
     sessions: &SessionTable,
 ) -> Response {
+    // A session whose shell exited is unusable; drop it before checking the name.
+    let stale = {
+        let table = sessions.lock().unwrap();
+        table.get(name).map(|s| !s.is_alive()).unwrap_or(false)
+    };
+    if stale {
+        let removed = { sessions.lock().unwrap().remove(name) };
+        drop(removed);
+    }
+
     let mut table = sessions.lock().unwrap();
     if table.contains_key(name) {
         return Response::err(format!("session '{}' already exists", name));
@@ -195,6 +205,19 @@ fn handle_continue(
     sessions: &SessionTable,
 ) -> Response {
     let mut table = sessions.lock().unwrap();
+    let alive = match table.get(name) {
+        Some(s) => s.is_alive(),
+        None => return Response::err(format!("session '{}' not found", name)),
+    };
+
+    // Attaching to a dead shell would only produce an immediate disconnect.
+    if !alive {
+        drop(table);
+        let removed = { sessions.lock().unwrap().remove(name) };
+        drop(removed);
+        return Response::err(format!("session '{}' has exited", name));
+    }
+
     let session = match table.get_mut(name) {
         Some(s) => s,
         None => return Response::err(format!("session '{}' not found", name)),
@@ -241,6 +264,23 @@ fn handle_resize(
 }
 
 fn handle_list(sessions: &SessionTable) -> Response {
+    // Drop sessions whose shell has exited so the listing reflects reality.
+    let dead: Vec<String> = {
+        let table = sessions.lock().unwrap();
+        table
+            .iter()
+            .filter(|(_, s)| !s.is_alive())
+            .map(|(n, _)| n.clone())
+            .collect()
+    };
+    if !dead.is_empty() {
+        let removed: Vec<Session> = {
+            let mut table = sessions.lock().unwrap();
+            dead.iter().filter_map(|n| table.remove(n)).collect()
+        };
+        drop(removed);
+    }
+
     let table = sessions.lock().unwrap();
     let infos: Vec<SessionInfo> = table
         .iter()

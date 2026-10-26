@@ -18,17 +18,41 @@ use windows::Win32::System::Console::{
     STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Pipes::CreatePipe;
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::Threading::{
     EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW,
-    PROCESS_INFORMATION,
+    PROCESS_INFORMATION, CREATE_UNICODE_ENVIRONMENT,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESHOWWINDOW,
+    GetCurrentProcess, OpenProcessToken,
 };
+use windows::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::Win32::System::Threading::{
     InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
     LPPROC_THREAD_ATTRIBUTE_LIST,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+
+/// Builds the user's own environment block (from the registry) for the child.
+///
+/// Otherwise the shell inherits whatever environment the daemon happened to be
+/// started with - e.g. NO_COLOR and TERM from a parent terminal - which changes
+/// how tools such as oh-my-posh render.
+fn user_environment() -> Option<(*mut c_void, HANDLE)> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token).ok()?;
+
+        let mut block: *mut c_void = ptr::null_mut();
+        match CreateEnvironmentBlock(&mut block, token, false) {
+            Ok(()) if !block.is_null() => Some((block, token)),
+            _ => {
+                let _ = CloseHandle(token);
+                None
+            }
+        }
+    }
+}
 
 /// A pseudo-terminal hosting a shell process.
 ///
@@ -149,7 +173,7 @@ impl Pty {
 
         let mut pi: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
-        let flags = EXTENDED_STARTUPINFO_PRESENT;
+        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
 
         // Windows copies the parent's standard handles into the child's process
         // parameters, and a redirected file/pipe handle wins over the pseudo
@@ -157,7 +181,9 @@ impl Pty {
         // of the PTY. Hide those handles for the duration of CreateProcessW.
         let _stdio = StdioHider::install();
 
-        unsafe {
+        let user_env = user_environment();
+
+        let result = unsafe {
             windows::Win32::System::Threading::CreateProcessW(
                 None,
                 windows::core::PWSTR::from_raw(cmd_buf.as_mut_ptr()),
@@ -165,13 +191,20 @@ impl Pty {
                 None,
                 false, // bInheritHandles - ConPTY handles the connection
                 flags,
-                None, // lpEnvironment - inherit parent's
+                user_env.as_ref().map(|(block, _)| *block as *const c_void),
                 None, // lpCurrentDirectory - inherit parent's
                 &mut si as *mut STARTUPINFOEXW as *mut _,
                 &mut pi,
             )
-            .context("CreateProcessW failed")?;
+        };
+
+        if let Some((block, token)) = user_env {
+            unsafe {
+                let _ = DestroyEnvironmentBlock(block);
+                let _ = CloseHandle(token);
+            }
         }
+        result.map_err(|e| anyhow::anyhow!("CreateProcessW failed: 0x{:08X}", e.code().0 as u32))?;
 
         self.process = Some(pi);
         Ok(())
@@ -321,3 +354,4 @@ impl Drop for Pty {
         }
     }
 }
+

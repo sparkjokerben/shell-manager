@@ -124,6 +124,11 @@ impl Session {
         self.pty.lock().unwrap().resize(cols, rows)
     }
 
+    /// Whether the hosted shell process is still running.
+    pub fn is_alive(&self) -> bool {
+        self.pty.lock().unwrap().is_running()
+    }
+
     /// Stop the session: signal and cancel both directional threads.
     pub fn stop(&self) -> Result<()> {
         *self.state.lock().unwrap() = SessionState::Stopped;

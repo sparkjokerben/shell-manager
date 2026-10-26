@@ -169,23 +169,39 @@ fn current_size() -> (Option<u16>, Option<u16>) {
 }
 
 /// Open one end of a session pipe with the required access.
+///
+/// The daemon creates a single pipe instance per direction, so a previous
+/// client that is still tearing down makes CreateFile fail with ERROR_PIPE_BUSY.
+/// Wait for the instance to become free instead of failing the attach.
 fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
+    const ERROR_PIPE_BUSY: u32 = 0x8007_00E7;
     let w = wide(name);
-    let h = unsafe {
-        CreateFileW(
-            PCWSTR::from_raw(w.as_ptr()),
-            access,
-            FILE_SHARE_MODE(0),
-            None,
-            OPEN_EXISTING,
-            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-            None,
-        )
-    };
-    match h {
-        Ok(h) => Ok(h),
-        Err(_) => anyhow::bail!("failed to connect to data pipe {}", name),
+
+    for _ in 0..40 {
+        let h = unsafe {
+            CreateFileW(
+                PCWSTR::from_raw(w.as_ptr()),
+                access,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                None,
+            )
+        };
+        match h {
+            Ok(h) => return Ok(h),
+            Err(e) if (e.code().0 as u32) == ERROR_PIPE_BUSY => unsafe {
+                let _ = windows::Win32::System::Pipes::WaitNamedPipeW(
+                    PCWSTR::from_raw(w.as_ptr()),
+                    500,
+                );
+            },
+            Err(e) => anyhow::bail!("failed to connect to data pipe {}: {}", name, e),
+        }
     }
+
+    anyhow::bail!("timed out connecting to data pipe {}", name)
 }
 
 /// Detects the "~." detach sequence at the start of a line, like ssh.
