@@ -217,7 +217,7 @@ impl Pty {
             // alias (Microsoft Store pwsh) only activates in an interactive
             // session, so a background daemon cannot start it.
             let hint = if code == 0x8007_0005 || code == 0xC007_0005 {
-                " (access denied; a Microsoft Store app alias cannot be started from a background session - use an MSI or zip install of PowerShell 7)"
+                " (access denied; a Microsoft Store app alias only starts in an interactive session)"
             } else {
                 ""
             };

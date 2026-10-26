@@ -170,21 +170,41 @@ fn handle_start(
         return Response::err(format!("session '{}' already exists", name));
     }
 
-    let cmd = if wsl.unwrap_or(false) {
-        "wsl.exe".to_string()
-    } else {
-        // 首选可执行的非打包版 PowerShell 7（MSI/zip 安装）；Store 版的
-        // WindowsApps 别名只能在交互会话里激活，后台会话会 ACCESS_DENIED。
-        crate::shell::default_shell()
-    };
-
     let (c, r) = (cols.unwrap_or(120), rows.unwrap_or(40));
 
-    match Session::new(name, c, r, &cmd) {
-        Ok(session) => {
+    // A default session walks the candidate shells until one starts. The first
+    // candidate that exists is not necessarily the first one that works: a
+    // Microsoft Store pwsh is an MSIX alias, which only activates in an
+    // interactive session.
+    let shells: Vec<String> = if wsl.unwrap_or(false) {
+        vec!["wsl.exe".to_string()]
+    } else {
+        crate::shell::shell_candidates()
+    };
+
+    let mut started: Option<(Session, String)> = None;
+    let mut last_err = None;
+    for shell in &shells {
+        match Session::new(name, c, r, shell) {
+            Ok(session) => {
+                started = Some((session, shell.clone()));
+                break;
+            }
+            Err(e) => {
+                crate::log::info(&format!(
+                    "start name={} shell={} failed: {:#}",
+                    name, shell, e
+                ));
+                last_err = Some(e);
+            }
+        }
+    }
+
+    match started {
+        Some((session, shell)) => {
             crate::log::info(&format!(
                 "start name={} shell={} size={}x{}",
-                name, cmd, c, r
+                name, shell, c, r
             ));
             let session_id = session.session_id.clone();
             let (pipe_out, pipe_in) = session.data_pipe_paths();
@@ -201,10 +221,12 @@ fn handle_start(
             });
             Response::ok(Some(data))
         }
-        Err(e) => {
-            crate::log::info(&format!("start name={} shell={} failed: {:#}", name, cmd, e));
-            Response::err(format!("failed to create session: {}", e))
-        }
+        None => Response::err(format!(
+            "failed to create session: {}",
+            last_err
+                .map(|e| format!("{:#}", e))
+                .unwrap_or_else(|| "no shell candidates".to_string())
+        )),
     }
 }
 

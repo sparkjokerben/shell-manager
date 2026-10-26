@@ -1,36 +1,60 @@
-//! Picking a PowerShell binary that the daemon can actually start.
+//! Choosing the PowerShell to run a default (non-WSL) session with.
 //!
-//! The Microsoft Store build of PowerShell 7 is an MSIX package: its
-//! `WindowsApps\pwsh.exe` execution alias can only be activated from an
-//! interactive session. A daemon running in session 0 - for instance one
-//! started from an SSH window - gets ERROR_ACCESS_DENIED from CreateProcessW.
-//! Prefer an unpackaged install (MSI or zip) at a known location, and fall back
-//! to Windows PowerShell 5.1, which always starts.
+//! Preference is an unpackaged install, then whatever `pwsh.exe` resolves to
+//! (which on this machine is the Microsoft Store build), then Windows
+//! PowerShell 5.1. The daemon tries the candidates in order and keeps the first
+//! one that actually starts: a Store alias is an MSIX app, so starting it needs
+//! an interactive session and fails with ERROR_ACCESS_DENIED in session 0.
 
 use std::path::{Path, PathBuf};
 
-/// Resolve the command for a default (non-WSL) session.
-pub fn default_shell() -> String {
-    pick(&candidates(), |p| p.is_file())
-        .to_string_lossy()
-        .into_owned()
+/// Shell commands to try, in order, for a default session.
+pub fn shell_candidates() -> Vec<String> {
+    let all = candidates();
+    let mut found: Vec<PathBuf> = all.iter().filter(|p| p.is_file()).cloned().collect();
+    if found.is_empty() {
+        // None of the preferred paths exists; still offer the last resort so the
+        // caller gets CreateProcessW's error rather than an empty list.
+        if let Some(last) = all.last() {
+            found.push(last.clone());
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for path in found {
+        let s = path.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
-/// Candidate shells in preference order; the last one is the unconditional
-/// fallback and is therefore never filtered out by `pick`.
+/// Best guess for logging: the first candidate that exists.
+pub fn default_shell() -> String {
+    shell_candidates().into_iter().next().unwrap_or_default()
+}
+
 fn candidates() -> Vec<PathBuf> {
     let program_files = std::env::var_os("ProgramFiles")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
     let mut out = vec![program_files.join(r"PowerShell\7\pwsh.exe")];
 
-    // Per-user MSI or zip install.
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        out.push(PathBuf::from(local).join(r"Microsoft\PowerShell\7\pwsh.exe"));
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    if let Some(local) = &local_app_data {
+        // Per-user MSI or zip install.
+        out.push(local.join(r"Microsoft\PowerShell\7\pwsh.exe"));
     }
 
     if let Some(p) = path_pwsh() {
         out.push(p);
+    }
+
+    if let Some(local) = &local_app_data {
+        // Microsoft Store build: works when the daemon runs in an interactive
+        // session, denied when it runs in session 0.
+        out.push(local.join(r"Microsoft\WindowsApps\pwsh.exe"));
     }
 
     let root = std::env::var_os("SystemRoot")
@@ -40,27 +64,15 @@ fn candidates() -> Vec<PathBuf> {
     out
 }
 
-/// `pwsh.exe` from PATH, skipping the Store execution alias.
-///
-/// The alias lives under `...\Microsoft\WindowsApps`; a real install dropped on
-/// PATH (zip deployment) is fine.
 fn path_pwsh() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("pwsh.exe");
-        if candidate.is_file() && !is_store_alias(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("pwsh.exe"))
+        .find(|candidate| candidate.is_file())
 }
 
-fn is_store_alias(p: &Path) -> bool {
-    p.to_string_lossy()
-        .to_ascii_lowercase()
-        .contains(r"\microsoft\windowsapps\")
-}
-
+/// First existing candidate, or the last one when none exists.
+#[cfg(test)]
 fn pick<F: Fn(&Path) -> bool>(candidates: &[PathBuf], exists: F) -> PathBuf {
     candidates
         .iter()
@@ -87,23 +99,26 @@ mod tests {
     }
 
     #[test]
-    fn store_alias_is_detected() {
-        assert!(is_store_alias(Path::new(
-            r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\pwsh.exe"
-        )));
-        assert!(is_store_alias(Path::new(
-            r"c:\users\me\appdata\local\microsoft\windowsapps\pwsh.exe"
-        )));
-        assert!(!is_store_alias(Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe")));
-    }
-
-    #[test]
-    fn windows_powershell_is_the_last_resort() {
+    fn candidates_are_ordered_and_end_with_windows_powershell() {
         let candidates = candidates();
         let last = candidates.last().unwrap();
         assert_eq!(
             last.file_name().unwrap().to_string_lossy().to_lowercase(),
             "powershell.exe"
         );
+        assert_eq!(
+            candidates[0].file_name().unwrap().to_string_lossy().to_lowercase(),
+            "pwsh.exe"
+        );
+    }
+
+    #[test]
+    fn shell_candidates_are_deduplicated() {
+        let list = shell_candidates();
+        assert!(!list.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for c in &list {
+            assert!(seen.insert(c.clone()), "duplicate candidate: {}", c);
+        }
     }
 }
