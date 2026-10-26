@@ -192,6 +192,36 @@ fn current_size() -> (Option<u16>, Option<u16>) {
     }
 }
 
+/// Force the hosted app to redraw its whole screen after attaching.
+///
+/// Apps redraw when the window size changes, so shrink the pseudo console by a
+/// row and restore it. The pause between the two is essential: sent back to
+/// back, the app can see only the final size and skip the redraw, which leaves
+/// the last line of a TUI untouched - the screen then looks restored except for
+/// its bottom row.
+fn force_repaint(name: &str) {
+    let (Some(cols), Some(rows)) = current_size() else {
+        return;
+    };
+    if rows < 2 {
+        return;
+    }
+    let resize = |rows: u16| {
+        let req = Request {
+            op: Op::Resize,
+            name: name.to_string(),
+            wsl: None,
+            cols: Some(cols),
+            rows: Some(rows),
+        };
+        // Failures are non-fatal: the session may be gone already.
+        let _ = protocol::pipe_request(protocol::CONTROL_PIPE, &req);
+    };
+    resize(rows - 1);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    resize(rows);
+}
+
 /// Open one end of a session pipe with the required access.
 ///
 /// The daemon creates a single pipe instance per direction, so a previous
@@ -230,7 +260,7 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 
 /// Bumped whenever the client's input handling changes, so a stale attach is
 /// easy to spot in the banner.
-const CLIENT_BUILD: &str = "client 2026-10-26c";
+const CLIENT_BUILD: &str = "client 2026-10-26d";
 
 /// Appends a diagnostic line to %TEMP%\sd-client.log.
 ///
@@ -595,9 +625,10 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
         eprintln!("[sd] no console detected; forwarding without raw mode");
     }
 
-    // Print before connecting: once connected, the daemon starts streaming PTY
-    // output, and mixing console-wide prints with raw byte writes garbles the line.
-    println!("\r\nattached ({}, detach: Ctrl+] or F12)", CLIENT_BUILD);
+    // Attaching silently keeps a running TUI's screen intact: any line printed
+    // here would scroll it and lose the bottom row. The client log records the
+    // attach instead, and the detach notice carries the build id.
+    let _ = write_all(stdout, b"");
     // Start from a clean terminal state, then restore the mouse modes the
     // hosted app had enabled before this client attached.
     if has_console {
@@ -626,6 +657,16 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     // is needed (it would require extra access rights on a read-only handle).
     let h_out = open_pipe(pipe_out, GENERIC_READ.0)?;
     let h_in = open_pipe(pipe_in, GENERIC_WRITE.0)?;
+
+    // Nothing else tells the hosted app that the screen should be redrawn, so
+    // make it repaint once the daemon has accepted this client.
+    {
+        let repaint_name = name.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            force_repaint(&repaint_name);
+        });
+    }
 
     // Put the local console into raw mode so input passes through byte-for-byte.
     let mut raw_in_mode = CONSOLE_MODE(0);
@@ -938,7 +979,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     }
     // Plain write instead of println!: a console write racing with teardown must
     // not panic the client with "failed printing to stdout".
-    let _ = write_all(stdout, b"\r\ndetached\r\n");
+    let _ = write_all(stdout, format!("\r\ndetached ({})\r\n", CLIENT_BUILD).as_bytes());
     Ok(())
 }
 
