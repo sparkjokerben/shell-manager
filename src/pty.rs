@@ -67,6 +67,9 @@ pub struct Pty {
     pub output_read: HANDLE,
     pub process: Option<PROCESS_INFORMATION>,
     pub attr_list_buf: Option<Vec<u8>>,
+    /// Current pseudo console size in columns and rows.
+    pub cols: u16,
+    pub rows: u16,
 }
 
 impl Pty {
@@ -81,12 +84,12 @@ impl Pty {
         }
 
         // Output pipe: PTY writes to output_write, parent reads from output_read.
-        // A larger buffer gives a detached session more headroom before the
-        // hosted program blocks on output the daemon is not draining.
+        // A modest buffer is enough because the daemon keeps draining even while
+        // no client is attached.
         let mut output_read: HANDLE = unsafe { mem::zeroed() };
         let mut output_write: HANDLE = unsafe { mem::zeroed() };
         unsafe {
-            CreatePipe(&mut output_read, &mut output_write, None, 1024 * 1024)
+            CreatePipe(&mut output_read, &mut output_write, None, 64 * 1024)
                 .context("CreatePipe (output) failed")?;
         }
 
@@ -109,6 +112,8 @@ impl Pty {
             output_read,
             process: None,
             attr_list_buf: None,
+            cols,
+            rows,
         })
     }
 
@@ -271,6 +276,8 @@ impl Pty {
             )
             .context("ResizePseudoConsole failed")?;
         }
+        self.cols = cols;
+        self.rows = rows;
         Ok(())
     }
 

@@ -27,6 +27,7 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, NMPWAIT_WAIT_FOREVER,
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows::Win32::System::Console::{COORD, ResizePseudoConsole};
 
 const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-daemon\data";
 
@@ -51,6 +52,8 @@ pub struct Session {
     pub client_connected: Arc<AtomicBool>,
     /// Set by an out-of-band detach request; both forwarder threads watch it.
     pub detach_requested: Arc<AtomicBool>,
+    /// Set when a client connection ends; the next attach forces a repaint.
+    pub needs_repaint: Arc<AtomicBool>,
     /// Win32 thread ids of the out/in threads (for cancelling blocking I/O).
     pub out_tid: Arc<Mutex<Option<u32>>>,
     pub in_tid: Arc<Mutex<Option<u32>>>,
@@ -70,6 +73,7 @@ impl Session {
             stop_flag: Arc::new(AtomicBool::new(false)),
             client_connected: Arc::new(AtomicBool::new(false)),
             detach_requested: Arc::new(AtomicBool::new(false)),
+            needs_repaint: Arc::new(AtomicBool::new(false)),
             out_tid: Arc::new(Mutex::new(None)),
             in_tid: Arc::new(Mutex::new(None)),
         })
@@ -104,6 +108,8 @@ impl Session {
         let in_tid = self.in_tid.clone();
         let detach_out = self.detach_requested.clone();
         let detach_in = self.detach_requested.clone();
+        let repaint_out = self.needs_repaint.clone();
+        let repaint_in = self.needs_repaint.clone();
 
         // In thread (client -> PTY).
         let in_tid_slot = in_tid.clone();
@@ -111,15 +117,21 @@ impl Session {
         thread::spawn(move || {
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             *in_tid_slot.lock().unwrap() = Some(tid);
-            run_in_thread(in_h, pty_in, state_in, stop_in_thread, alive_in, detach_in);
+            run_in_thread(in_h, pty_in, state_in, stop_in_thread, alive_in, detach_in, repaint_in);
         });
 
         // Out thread (PTY -> client).
         thread::spawn(move || {
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             *out_tid.lock().unwrap() = Some(tid);
-            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out);
+            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out, repaint_out);
         });
+
+        // Drain thread (PTY -> discard while no client is attached).
+        let drain_pty = self.pty.clone();
+        let drain_stop = self.stop_flag.clone();
+        let drain_connected = self.client_connected.clone();
+        thread::spawn(move || run_drain_thread(drain_pty, drain_stop, drain_connected));
 
         Ok(())
     }
@@ -220,6 +232,66 @@ fn cancel_thread_io(tid: Option<u32>) {
     }
 }
 
+/// Keep the PTY output flowing while no client is attached, so a detached
+/// TUI does not block on a full output pipe. Discards the bytes: the
+/// console buffer in ConPTY keeps the screen state for the reattach repaint.
+fn run_drain_thread(pty: Arc<Mutex<Pty>>, stop: Arc<AtomicBool>, connected: Arc<AtomicBool>) {
+    enum Status {
+        Attached,
+        Read,
+        Idle,
+        Dead,
+    }
+
+    let mut buf = [0u8; 8192];
+    let mut idle_ticks: u32 = 0;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // The attach flag is checked under the same pty lock the out thread
+        // takes when it claims the stream, so the switch-over cannot tear.
+        let status = {
+            let p = pty.lock().unwrap();
+            if connected.load(Ordering::Relaxed) {
+                Status::Attached
+            } else {
+                match p.available() {
+                    // Read under the same lock as the availability check: a
+                    // blocking read with no data would hold the pty lock and
+                    // stall is_alive / resize / stop.
+                    Ok(n) if n > 0 => match p.read_output(&mut buf) {
+                        Ok(n) if n > 0 => Status::Read,
+                        _ => Status::Dead,
+                    },
+                    Ok(_) => Status::Idle,
+                    Err(_) => Status::Dead,
+                }
+            }
+        };
+
+        match status {
+            Status::Read => idle_ticks = 0,
+            Status::Attached => {
+                idle_ticks = 0;
+                thread::sleep(Duration::from_millis(5));
+            }
+            Status::Idle => {
+                idle_ticks = idle_ticks.wrapping_add(1);
+                // Confirm the shell is still alive now and then, so the drain
+                // thread cannot keep a dead session's Pty alive forever.
+                if idle_ticks % 200 == 0 && !pty.lock().unwrap().is_running() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Status::Dead => break,
+        }
+    }
+}
+
 /// Accept one client, forward input to the PTY, then loop for the next client.
 fn run_in_thread(
     server: HANDLE,
@@ -228,6 +300,7 @@ fn run_in_thread(
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     detach: Arc<AtomicBool>,
+    needs_repaint: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -269,6 +342,7 @@ fn run_in_thread(
 
         alive.store(false, Ordering::Relaxed);
         set_detached(&state);
+        needs_repaint.store(true, Ordering::Relaxed);
 
         unsafe {
             let _ = DisconnectNamedPipe(server);
@@ -288,7 +362,14 @@ fn run_out_thread(
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     detach: Arc<AtomicBool>,
+    needs_repaint: Arc<AtomicBool>,
 ) {
+    enum LoopState {
+        Data(usize),
+        Idle,
+        Dead,
+    }
+
     let mut buf = [0u8; 8192];
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -305,9 +386,38 @@ fn run_out_thread(
             continue;
         }
 
+        // Claim the output stream under the pty lock so the drain thread cannot
+        // read (and discard) bytes after this client has taken over.
+        {
+            let _p = pty.lock().unwrap();
+            alive.store(true, Ordering::Relaxed);
+            detach.store(false, Ordering::Relaxed);
+        }
+
         set_attached(&state);
-        alive.store(true, Ordering::Relaxed);
-        detach.store(false, Ordering::Relaxed);
+
+        // Toggling the size makes ConPTY re-emit the whole screen, restoring
+        // TUIs that kept running while detached. Done without the pty lock: the
+        // redraw can fill the output pipe and the forward loop below must stay
+        // free to drain it.
+        if needs_repaint.swap(false, Ordering::Relaxed) {
+            let (hpc, c, r) = {
+                let p = pty.lock().unwrap();
+                (p.hpc, p.cols, p.rows)
+            };
+            if r > 1 {
+                unsafe {
+                    let _ = ResizePseudoConsole(hpc, COORD { X: c as i16, Y: (r - 1) as i16 });
+                    // Restore with retries: a failed restore would leave the
+                    // session one row short until the next resize request.
+                    for _ in 0..3 {
+                        if ResizePseudoConsole(hpc, COORD { X: c as i16, Y: r as i16 }).is_ok() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         'forward: loop {
             // Checked on every iteration, including while output is flowing: a
@@ -319,48 +429,54 @@ fn run_out_thread(
                 break 'forward;
             }
 
-            let avail = {
+            // Availability and the read happen under one lock: the drain thread
+            // is a second reader, and a read issued after a stale "available"
+            // sample would block while holding the pty lock.
+            let state = {
                 let p = pty.lock().unwrap();
                 match p.available() {
-                    Ok(n) => n,
-                    // Broken pipe: child process exited.
-                    Err(_) => break 'forward,
+                    Ok(n) if n > 0 => match p.read_output(&mut buf) {
+                        Ok(n) if n > 0 => LoopState::Data(n as usize),
+                        // Broken pipe: child process exited.
+                        _ => LoopState::Dead,
+                    },
+                    Ok(_) => LoopState::Idle,
+                    Err(_) => LoopState::Dead,
                 }
             };
 
-            if avail > 0 {
-                let n = match pty.lock().unwrap().read_output(&mut buf) {
-                    Ok(0) => break 'forward,
-                    Ok(n) => n as usize,
-                    Err(_) => break 'forward,
-                };
-
-                let mut pos: usize = 0;
-                while pos < n {
-                    let mut written: u32 = 0;
-                    let r = unsafe {
-                        WriteFile(server, Some(&buf[pos..n]), Some(&mut written), None)
-                    };
-                    match r {
-                        Ok(()) if written > 0 => pos += written as usize,
-                        Ok(()) => break,
-                        Err(_) => break 'forward,
+            match state {
+                LoopState::Data(n) => {
+                    let mut pos: usize = 0;
+                    while pos < n {
+                        let mut written: u32 = 0;
+                        let r = unsafe {
+                            WriteFile(server, Some(&buf[pos..n]), Some(&mut written), None)
+                        };
+                        match r {
+                            Ok(()) if written > 0 => pos += written as usize,
+                            Ok(()) => break,
+                            Err(_) => break 'forward,
+                        }
                     }
                 }
-            } else {
-                // No pending output. Stop if the client left or the shell exited.
-                if !alive.load(Ordering::Relaxed) {
-                    break 'forward;
+                LoopState::Idle => {
+                    // No pending output. Stop if the client left or the shell exited.
+                    if !alive.load(Ordering::Relaxed) {
+                        break 'forward;
+                    }
+                    if !pty.lock().unwrap().is_running() {
+                        break 'forward;
+                    }
+                    thread::sleep(Duration::from_millis(2));
                 }
-                if !pty.lock().unwrap().is_running() {
-                    break 'forward;
-                }
-                thread::sleep(Duration::from_millis(2));
+                LoopState::Dead => break 'forward,
             }
         }
 
         alive.store(false, Ordering::Relaxed);
         set_detached(&state);
+        needs_repaint.store(true, Ordering::Relaxed);
 
         unsafe {
             let _ = DisconnectNamedPipe(server);
@@ -519,5 +635,102 @@ mod tests {
             let _ = CloseHandle(h_in2);
         }
         session.stop().unwrap();
+    }
+
+    /// While detached, the daemon must keep draining PTY output; otherwise a
+    /// program producing more than one pipe buffer blocks and never finishes.
+    #[test]
+    fn detached_program_is_not_blocked() {
+        let marker = std::env::temp_dir().join(format!("sd-drain-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let session = Session::new("unit-drain", 80, 25, "cmd.exe").unwrap();
+        session.start_data_pipe_listener().unwrap();
+        let (out_path, in_path) = session.data_pipe_paths();
+
+        let h_out = open(&out_path, GENERIC_READ.0);
+        let h_in = open(&in_path, GENERIC_WRITE.0);
+
+        // More than one 64 KiB pipe buffer of output, then a marker file.
+        let cmd = format!(
+            "(for /L %i in (1,1,20000) do @echo LINE %i) & echo DONE> \"{}\"\r\n",
+            marker.display()
+        );
+        let mut written: u32 = 0;
+        unsafe { WriteFile(h_in, Some(cmd.as_bytes()), Some(&mut written), None).unwrap() };
+
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut total = 0usize;
+        while Instant::now() < deadline && total < 4096 {
+            match read_some(h_out, &mut buf) {
+                Ok(n) => total += n,
+                Err(_) => break,
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(total >= 4096, "expected output before detach");
+
+        session.detach_client();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut closed = false;
+        while Instant::now() < deadline {
+            match read_some(h_out, &mut buf) {
+                Ok(_) => {}
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(closed, "detach did not disconnect the client");
+
+        // A real client process exits here, closing both of its handles.
+        unsafe {
+            let _ = CloseHandle(h_out);
+            let _ = CloseHandle(h_in);
+        }
+
+        // Without the drain thread the loop would stall once the 64 KiB output
+        // pipe fills, so the marker would never appear.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut contents = String::new();
+        loop {
+            if let Ok(c) = std::fs::read_to_string(&marker) {
+                contents = c;
+                if contents.contains("DONE") {
+                    break;
+                }
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(marker.exists(), "detached program did not finish");
+        assert!(contents.contains("DONE"), "marker missing DONE");
+
+        // Reattach and force a repaint.
+        let h_out2 = open(&out_path, GENERIC_READ.0);
+        let h_in2 = open(&in_path, GENERIC_WRITE.0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = 0usize;
+        while Instant::now() < deadline && got == 0 {
+            match read_some(h_out2, &mut buf) {
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(got > 0, "no output after reattach");
+
+        unsafe {
+            let _ = CloseHandle(h_out2);
+            let _ = CloseHandle(h_in2);
+        }
+        session.stop().unwrap();
+        let _ = std::fs::remove_file(&marker);
     }
 }

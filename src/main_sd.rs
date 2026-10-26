@@ -222,6 +222,42 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
     anyhow::bail!("timed out connecting to data pipe {}", name)
 }
 
+const DETACH_KEY: u8 = 0x1d;
+
+/// Position of the Ctrl+] detach key in a read, if present.
+fn detach_key_pos(data: &[u8]) -> Option<usize> {
+    data.iter().position(|&b| b == DETACH_KEY)
+}
+
+/// Wait (bounded) for the reader thread to publish its thread id, then cancel
+/// its blocking read until it reports done.
+fn stop_reader(reader_tid: &AtomicU32, reader_done: &AtomicBool) {
+    // The reader sets its id first thing, but the thread may not have been
+    // scheduled yet.
+    let mut waited = 0u32;
+    while reader_tid.load(Ordering::Relaxed) == 0 && waited < 100 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 1;
+    }
+    unsafe {
+        use windows::Win32::System::IO::CancelSynchronousIo;
+        use windows::Win32::System::Threading::{OpenThread, THREAD_TERMINATE};
+        // Retry until the reader has finished: the first cancellation may land
+        // before it posts its read.
+        while !reader_done.load(Ordering::Relaxed) {
+            if let Ok(ht) = OpenThread(
+                THREAD_TERMINATE,
+                false,
+                reader_tid.load(Ordering::Relaxed),
+            ) {
+                let _ = CancelSynchronousIo(ht);
+                let _ = windows::Win32::Foundation::CloseHandle(ht);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 /// Detects the "~." detach sequence at the start of a line, like ssh.
 ///
 /// A "~" typed at line start is held back until the next byte arrives, so a
@@ -284,7 +320,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
 
     // Print before connecting: once connected, the daemon starts streaming PTY
     // output, and mixing console-wide prints with raw byte writes garbles the line.
-    println!("\r\nattached (detach: type ~. at the start of a line)");
+    println!("\r\nattached (detach: Ctrl+] or ~. at line start)");
 
     // Two unidirectional handles: out is read-only, in is write-only.
     // Byte-type pipes use byte read mode by default, so no SetNamedPipeHandleState
@@ -412,6 +448,15 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
                 Ok(()) if read == 0 => break,
                 Ok(()) => {
                     let data = &buf[..read as usize];
+                    if let Some(pos) = detach_key_pos(data) {
+                        // Forward whatever preceded the key on this read, then
+                        // tear the connection down.
+                        if pos > 0 {
+                            let _ = write_all(h_in, &data[..pos]);
+                        }
+                        stop_reader(&stdin_reader_tid, &stdin_done);
+                        break;
+                    }
                     let (forward, detach) = detector.feed(data);
                     if detach {
                         // Forward whatever preceded the escape on this read
@@ -420,31 +465,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
                             let _ = write_all(h_in, &forward);
                         }
                         // Unblock the reader thread's ReadFile on the out pipe.
-                        // Wait (bounded) for it to publish its thread id: it is
-                        // set first thing in the closure, but the thread may not
-                        // have been scheduled yet.
-                        let mut waited = 0u32;
-                        while stdin_reader_tid.load(Ordering::Relaxed) == 0 && waited < 100 {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                            waited += 1;
-                        }
-                        unsafe {
-                            use windows::Win32::System::IO::CancelSynchronousIo;
-                            use windows::Win32::System::Threading::{OpenThread, THREAD_TERMINATE};
-                            // Retry until the reader has finished: the first
-                            // cancellation may land before it posts its read.
-                            while !stdin_done.load(Ordering::Relaxed) {
-                                if let Ok(ht) = OpenThread(
-                                    THREAD_TERMINATE,
-                                    false,
-                                    stdin_reader_tid.load(Ordering::Relaxed),
-                                ) {
-                                    let _ = CancelSynchronousIo(ht);
-                                    let _ = windows::Win32::Foundation::CloseHandle(ht);
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(20));
-                            }
-                        }
+                        stop_reader(&stdin_reader_tid, &stdin_done);
                         break;
                     }
                     if !forward.is_empty() && !write_all(h_in, &forward)? {
@@ -526,7 +547,22 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::DetachDetector;
+    use super::{detach_key_pos, DetachDetector};
+
+    #[test]
+    fn detach_key_absent() {
+        assert_eq!(detach_key_pos(b"hello\r\n"), None);
+    }
+
+    #[test]
+    fn detach_key_at_start() {
+        assert_eq!(detach_key_pos(b"\x1drest"), Some(0));
+    }
+
+    #[test]
+    fn detach_key_after_bytes() {
+        assert_eq!(detach_key_pos(b"abcd\x1d"), Some(4));
+    }
 
     #[test]
     fn detach_sequence_split_across_reads() {
