@@ -78,6 +78,33 @@ Claude Code), it keeps running: the daemon keeps draining the pseudo console so
 the program never blocks on a full output pipe, and a reattach repaints the
 whole screen.
 
+## Development instances
+
+Builds run from this repository are isolated from the installed production
+daemon, so you can hack on `sm`/`smd` while your everyday sessions keep running:
+
+- An executable located under this project's `target/` directory automatically
+  uses the `dev` instance.
+- Any other executable uses `prod`, which keeps the historical names.
+- `SM_INSTANCE=<name>` selects another namespace. The value is trimmed and
+  lowercased; it must be 1-32 characters of `A-Z a-z 0-9 - _`. An invalid value
+  is ignored (with a warning) and falls through to the rules above, so a typo
+  can never reconnect a development build to production.
+
+Every instance has its own control pipe, data pipes, single-instance mutex and
+logs (`%TEMP%\smd-<instance>.log`, `%TEMP%\sm-client-<instance>.log`).
+Production keeps `\\.\pipe\shell-manager\...`, `Global\smd-single-instance` and
+`%TEMP%\smd.log`, so upgrading does not disturb a running daemon.
+
+Run a development daemon and client next to the installed production pair:
+
+```powershell
+cargo run --bin smd      # serves the "dev" namespace
+cargo run --bin sm -- ls # talks to that dev daemon
+```
+
+`sm --version` prints the instance it resolved.
+
 ## How it works
 
 ```text
@@ -117,9 +144,10 @@ terminal ── sm.exe ──┬── control pipe ──┐
 
 ## Debugging
 
-- `%TEMP%\smd.log` - daemon start, resolved shell, per-session start results.
-- `%TEMP%\sm-client.log` - client build id, console modes, raw stdin bytes and
-  detach decisions.
+- `%TEMP%\smd.log` (or `%TEMP%\smd-<instance>.log` outside production) -
+  daemon start, resolved shell, per-session start results.
+- `%TEMP%\sm-client.log` (or `%TEMP%\sm-client-<instance>.log`) - client build
+  id, console modes, raw stdin bytes and detach decisions.
 
 ## License
 

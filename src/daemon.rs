@@ -3,7 +3,7 @@
 //! Maintains a session table and serves control-pipe requests (START / CONTINUE / LIST / STOP).
 
 use crate::protocol::{
-    read_exact_pipe, write_all_pipe, Op, Request, Response, SessionInfo, CONTROL_PIPE,
+    control_pipe, read_exact_pipe, write_all_pipe, Op, Request, Response, SessionInfo,
     MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
 };
 use crate::session::{Session, SessionState};
@@ -33,7 +33,7 @@ pub struct Daemon {
 impl Daemon {
     pub fn new() -> Result<Self> {
         let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(
-            std::ffi::OsStr::new(CONTROL_PIPE),
+            std::ffi::OsStr::new(control_pipe()),
         )
         .chain(Some(0))
         .collect();
@@ -66,7 +66,7 @@ impl Daemon {
     /// Connections are handled serially: each request is short-lived
     /// (START/CONTINUE/LIST/STOP), so no per-connection thread is needed.
     pub fn run(&mut self) -> Result<()> {
-        println!("smd listening on {}", CONTROL_PIPE);
+        println!("smd listening on {}", control_pipe());
 
         loop {
             let connected = unsafe { crate::protocol::is_pipe_connected(&ConnectNamedPipe(self.control_pipe, None)) };

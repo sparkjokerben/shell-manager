@@ -29,7 +29,10 @@ usage: sm [name]          attach to <name>, creating it if needed
        sm detach [name]   disconnect the attached client, keep the shell
        sm stop [name]     destroy the session and its shell
        sm ls              list sessions
-options: --wsl  create the session with wsl.exe instead of PowerShell";
+options: --wsl  create the session with wsl.exe instead of PowerShell
+environment: SM_INSTANCE  use an isolated namespace for pipes, mutex and logs
+                          (1-32 chars of A-Z a-z 0-9 - _; default: prod, or dev
+                          for binaries built under target/)";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
@@ -103,7 +106,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Version => {
-            println!("{}", env!("CARGO_PKG_VERSION"));
+            println!("{} (instance {})", env!("CARGO_PKG_VERSION"), protocol::instance());
             Ok(())
         }
         Cmd::List => {
@@ -170,7 +173,7 @@ fn request_sized(
         cols,
         rows,
     };
-    protocol::pipe_request(protocol::CONTROL_PIPE, &req)
+    protocol::pipe_request(protocol::control_pipe(), &req)
 }
 
 fn control(op: Op, name: &str, action: &str) -> Result<()> {
@@ -343,7 +346,7 @@ fn force_repaint(name: &str) {
             rows: Some(rows),
         };
         // Failures are non-fatal: the session may be gone already.
-        let _ = protocol::pipe_request(protocol::CONTROL_PIPE, &req);
+        let _ = protocol::pipe_request(protocol::control_pipe(), &req);
     };
     resize(rows - 1);
     std::thread::sleep(std::time::Duration::from_millis(150));
@@ -396,7 +399,7 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 /// easy to spot in the banner.
 const CLIENT_BUILD: &str = "client 2026-10-26h";
 
-/// Appends a diagnostic line to %TEMP%\sm-client.log.
+/// Appends a diagnostic line to %TEMP%\sm-client[-<instance>].log.
 ///
 /// Always on and best-effort: it records events and byte counts, never key
 /// content, so passwords or API keys typed into the session cannot end up on
@@ -412,7 +415,7 @@ fn client_log(msg: &str) {
 
     static LOG: OnceLock<Mutex<Log>> = OnceLock::new();
     let slot = LOG.get_or_init(|| {
-        let path = std::env::temp_dir().join("sm-client.log");
+        let path = std::env::temp_dir().join(protocol::client_log_file());
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -916,7 +919,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                     rows: cur.1,
                 };
                 // Failures are non-fatal: the session may be gone already.
-                let _ = protocol::pipe_request(protocol::CONTROL_PIPE, &req);
+                let _ = protocol::pipe_request(protocol::control_pipe(), &req);
             }
         });
     }

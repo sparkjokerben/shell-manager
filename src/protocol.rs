@@ -1,12 +1,173 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::OnceLock;
 use windows::Win32::Foundation::HANDLE;
 
-/// IPC control pipe path shared between the sm client and smd.
-pub const CONTROL_PIPE: &str = r"\\.\pipe\shell-manager\control";
+/// Environment variable that overrides the instance namespace.
+const INSTANCE_ENV: &str = "SM_INSTANCE";
 
-/// Data pipe prefix: \\.\pipe\shell-manager\data\<session_id>
-pub const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-manager\data";
+static INSTANCE_NAME: OnceLock<String> = OnceLock::new();
+static CONTROL_PIPE_CACHE: OnceLock<String> = OnceLock::new();
+static DATA_PIPE_PREFIX_CACHE: OnceLock<String> = OnceLock::new();
+
+/// Pipe names for one instance. `prod` keeps the historical namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipePaths {
+    pub control: String,
+    /// Data pipe prefix: `<prefix>\<session_id>\out` / `<prefix>\<session_id>\in`.
+    pub data: String,
+}
+
+/// Normalize and validate an `SM_INSTANCE` value.
+///
+/// Returns the lowercased, trimmed name, or `None` when the value is not a
+/// legal namespace component. Callers must ignore `None` rather than falling
+/// back to the production namespace, so a typo can never reconnect a dev build
+/// to the production daemon.
+pub fn valid_instance(raw: &str) -> Option<String> {
+    let name = raw.trim().to_ascii_lowercase();
+    if name.is_empty() || name.len() > 32 {
+        return None;
+    }
+    if name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Resolve the instance name from the environment and executable path.
+///
+/// Pure so the precedence rules can be unit-tested; `instance()` supplies the
+/// real environment and `current_exe()`.
+pub fn resolve_instance(env: Option<&str>, exe: Option<&Path>) -> String {
+    if let Some(name) = env.and_then(valid_instance) {
+        return name;
+    }
+    match exe {
+        Some(exe) if is_under_target(exe) => "dev".to_string(),
+        _ => "prod".to_string(),
+    }
+}
+
+/// Whether `exe` is inside `<CARGO_MANIFEST_DIR>/target`.
+///
+/// Comparison is case-insensitive and treats `/` and `\` alike, since Windows
+/// paths can arrive in either form.
+fn is_under_target(exe: &Path) -> bool {
+    let target = normalize_path(env!("CARGO_MANIFEST_DIR")) + r"\target";
+    let exe = normalize_path(exe.to_string_lossy().as_ref());
+    exe.starts_with(&(target + r"\"))
+}
+
+fn normalize_path(path: &str) -> String {
+    path.replace('/', r"\").to_ascii_lowercase()
+}
+
+/// Namespace of this process, resolved once.
+///
+/// The installed production daemon and builds run straight out of `target/`
+/// must never share pipes, the single-instance mutex or logs, so every process
+/// resolves an instance name first:
+///
+/// 1. `SM_INSTANCE`, trimmed and lowercased, if it is 1-32 chars of
+///    `[A-Za-z0-9_-]`.
+/// 2. `dev` when the executable lives under `<CARGO_MANIFEST_DIR>/target`.
+/// 3. `prod` otherwise.
+///
+/// `prod` keeps the historical names, so an already-running production daemon
+/// is untouched by an upgrade.
+pub fn instance() -> &'static str {
+    INSTANCE_NAME.get_or_init(|| {
+        let raw = std::env::var(INSTANCE_ENV).ok();
+        if let Some(value) = raw.as_deref() {
+            if valid_instance(value).is_none() {
+                eprintln!(
+                    "warning: ignoring invalid {}={:?} (expected 1-32 chars of [A-Za-z0-9_-])",
+                    INSTANCE_ENV, value
+                );
+            }
+        }
+        resolve_instance(raw.as_deref(), std::env::current_exe().ok().as_deref())
+    })
+}
+
+/// True when this process uses the production namespace.
+pub fn is_prod() -> bool {
+    instance() == "prod"
+}
+
+/// IPC control pipe path shared between the sm client and smd.
+pub fn control_pipe() -> &'static str {
+    CONTROL_PIPE_CACHE.get_or_init(|| pipe_paths_for(instance()).control)
+}
+
+/// Data pipe prefix: `<prefix>\<session_id>`.
+pub fn data_pipe_prefix() -> &'static str {
+    DATA_PIPE_PREFIX_CACHE.get_or_init(|| pipe_paths_for(instance()).data)
+}
+
+/// Pipe names for `instance`, without any global state.
+pub fn pipe_paths_for(instance: &str) -> PipePaths {
+    if instance == "prod" {
+        PipePaths {
+            control: r"\\.\pipe\shell-manager\control".to_string(),
+            data: r"\\.\pipe\shell-manager\data".to_string(),
+        }
+    } else {
+        PipePaths {
+            control: format!(r"\\.\pipe\shell-manager-{}\control", instance),
+            data: format!(r"\\.\pipe\shell-manager-{}\data", instance),
+        }
+    }
+}
+
+/// `(global, local)` single-instance mutex names for `instance`.
+pub fn mutex_names_for(instance: &str) -> (String, String) {
+    if instance == "prod" {
+        (
+            r"Global\smd-single-instance".to_string(),
+            r"Local\smd-single-instance".to_string(),
+        )
+    } else {
+        (
+            format!(r"Global\smd-single-instance-{}", instance),
+            format!(r"Local\smd-single-instance-{}", instance),
+        )
+    }
+}
+
+/// Daemon log file name for `instance`, placed in `%TEMP%`.
+pub fn daemon_log_file_for(instance: &str) -> String {
+    if instance == "prod" {
+        "smd.log".to_string()
+    } else {
+        format!("smd-{}.log", instance)
+    }
+}
+
+/// Client log file name for `instance`, placed in `%TEMP%`.
+pub fn client_log_file_for(instance: &str) -> String {
+    if instance == "prod" {
+        "sm-client.log".to_string()
+    } else {
+        format!("sm-client-{}.log", instance)
+    }
+}
+
+/// Daemon log file name for this process.
+pub fn daemon_log_file() -> String {
+    daemon_log_file_for(instance())
+}
+
+/// Client log file name for this process.
+pub fn client_log_file() -> String {
+    client_log_file_for(instance())
+}
 
 /// Upper bound on a control-pipe request body (1 MiB).
 ///
@@ -274,6 +435,109 @@ mod tests {
             let _ = CloseHandle(write_end);
             let _ = CloseHandle(read_end);
         }
+    }
+
+    #[test]
+    fn production_paths_are_unchanged() {
+        let paths = pipe_paths_for("prod");
+        assert_eq!(paths.control, r"\\.\pipe\shell-manager\control");
+        assert_eq!(paths.data, r"\\.\pipe\shell-manager\data");
+        assert_eq!(
+            mutex_names_for("prod"),
+            (
+                r"Global\smd-single-instance".to_string(),
+                r"Local\smd-single-instance".to_string(),
+            )
+        );
+        assert_eq!(daemon_log_file_for("prod"), "smd.log");
+        assert_eq!(client_log_file_for("prod"), "sm-client.log");
+    }
+
+    #[test]
+    fn development_paths_use_the_dev_namespace() {
+        let paths = pipe_paths_for("dev");
+        assert_eq!(paths.control, r"\\.\pipe\shell-manager-dev\control");
+        assert_eq!(paths.data, r"\\.\pipe\shell-manager-dev\data");
+        assert_eq!(
+            mutex_names_for("dev"),
+            (
+                r"Global\smd-single-instance-dev".to_string(),
+                r"Local\smd-single-instance-dev".to_string(),
+            )
+        );
+        assert_eq!(daemon_log_file_for("dev"), "smd-dev.log");
+        assert_eq!(client_log_file_for("dev"), "sm-client-dev.log");
+    }
+
+    #[test]
+    fn custom_instance_paths_are_namespaced() {
+        let paths = pipe_paths_for("my_test-1");
+        assert_eq!(paths.control, r"\\.\pipe\shell-manager-my_test-1\control");
+        assert_eq!(paths.data, r"\\.\pipe\shell-manager-my_test-1\data");
+        assert_eq!(daemon_log_file_for("my_test-1"), "smd-my_test-1.log");
+    }
+
+    #[test]
+    fn valid_instance_normalizes_case_and_whitespace() {
+        assert_eq!(valid_instance("  DEV  "), Some("dev".into()));
+        assert_eq!(valid_instance("a_b-9"), Some("a_b-9".into()));
+        assert_eq!(valid_instance("x".repeat(32).as_str()), Some("x".repeat(32)));
+    }
+
+    #[test]
+    fn invalid_instance_values_are_rejected() {
+        assert_eq!(valid_instance(""), None);
+        assert_eq!(valid_instance("   "), None);
+        assert_eq!(valid_instance("x".repeat(33).as_str()), None);
+        assert_eq!(valid_instance("bad name"), None);
+        assert_eq!(valid_instance("bad\\name"), None);
+        assert_eq!(valid_instance("bad/name"), None);
+        assert_eq!(valid_instance("bad.name"), None);
+        assert_eq!(valid_instance("生产"), None);
+    }
+
+    fn manifest_exe(relative: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    #[test]
+    fn environment_override_wins() {
+        let exe = manifest_exe(r"target\debug\sm.exe");
+        assert_eq!(resolve_instance(Some("Staging"), Some(&exe)), "staging");
+        let outside = manifest_exe(r"bin\sm.exe");
+        assert_eq!(resolve_instance(Some("staging"), Some(&outside)), "staging");
+    }
+
+    #[test]
+    fn invalid_environment_falls_through_to_path_rules() {
+        let inside = manifest_exe(r"target\debug\sm.exe");
+        let outside = manifest_exe(r"bin\sm.exe");
+        assert_eq!(resolve_instance(Some("bad name"), Some(&inside)), "dev");
+        assert_eq!(resolve_instance(Some("bad name"), Some(&outside)), "prod");
+        assert_eq!(resolve_instance(None, Some(&outside)), "prod");
+    }
+
+    #[test]
+    fn executables_under_target_resolve_to_dev() {
+        let inside = manifest_exe(r"target\debug\sm.exe");
+        assert_eq!(resolve_instance(None, Some(&inside)), "dev");
+
+        // Separators and case do not matter on Windows.
+        let mixed = manifest_exe(r"TARGET\Debug\sm.exe");
+        assert_eq!(resolve_instance(None, Some(&mixed)), "dev");
+        let slashes = manifest_exe(r"target/debug/sm.exe");
+        assert_eq!(resolve_instance(None, Some(&slashes)), "dev");
+
+        // A sibling directory whose name merely starts with "target" is not it.
+        let sibling = manifest_exe(r"target-dev\sm.exe");
+        assert_eq!(resolve_instance(None, Some(&sibling)), "prod");
+    }
+
+    #[test]
+    fn executables_outside_target_resolve_to_prod() {
+        let outside = manifest_exe(r"bin\sm.exe");
+        assert_eq!(resolve_instance(None, Some(&outside)), "prod");
+        assert_eq!(resolve_instance(None, None), "prod");
     }
 
     /// A peer that closes without sending all promised bytes must be an error,

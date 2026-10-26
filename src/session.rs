@@ -8,7 +8,7 @@
 //! `ReadFile` against a `WriteFile` on the same synchronous (non-overlapped)
 //! pipe handle.
 
-use crate::protocol::DATA_PIPE_PREFIX;
+use crate::protocol::data_pipe_prefix;
 use crate::pty::Pty;
 use anyhow::Result;
 use std::sync::{
@@ -110,9 +110,10 @@ impl Session {
 
     /// (out_pipe_path, in_pipe_path) for this session.
     pub fn data_pipe_paths(&self) -> (String, String) {
+        let prefix = data_pipe_prefix();
         (
-            format!("{}\\{}\\out", DATA_PIPE_PREFIX, self.session_id),
-            format!("{}\\{}\\in", DATA_PIPE_PREFIX, self.session_id),
+            format!("{}\\{}\\out", prefix, self.session_id),
+            format!("{}\\{}\\in", prefix, self.session_id),
         )
     }
 

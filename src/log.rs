@@ -9,7 +9,7 @@ use std::io::Write;
 const MAX_BYTES: u64 = 1024 * 1024;
 
 pub fn info(msg: &str) {
-    let path = std::env::temp_dir().join("smd.log");
+    let path = std::env::temp_dir().join(crate::protocol::daemon_log_file());
 
     // Keep the file bounded: start over once it grows past the cap.
     if std::fs::metadata(&path).map(|m| m.len() > MAX_BYTES).unwrap_or(false) {
