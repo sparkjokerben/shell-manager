@@ -12,7 +12,7 @@ use windows::Win32::System::Console::{
     GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO,
     GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
     ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT, ENABLE_MOUSE_INPUT,
-    ENABLE_PROCESSED_OUTPUT, ENABLE_WRAP_AT_EOL_OUTPUT, CONSOLE_MODE,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, CONSOLE_MODE,
 };
 use windows::core::PCWSTR;
 use shell_daemon::protocol::{self, Request, Op};
@@ -227,10 +227,13 @@ fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
                 | ENABLE_PROCESSED_INPUT.0
                 | ENABLE_WINDOW_INPUT.0
                 | ENABLE_MOUSE_INPUT.0);
-        let raw_out = orig_out_mode.0 & !(ENABLE_PROCESSED_OUTPUT.0 | ENABLE_WRAP_AT_EOL_OUTPUT.0);
+        // Enable ANSI/VT interpretation on the local console so the PTY's escape
+        // sequences are rendered, not printed as literal text.
+        let raw_out = orig_out_mode.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0;
         unsafe {
             SetConsoleMode(stdin, CONSOLE_MODE(raw_in))?;
-            SetConsoleMode(stdout, CONSOLE_MODE(raw_out))?;
+            // VT processing is best-effort (older consoles may reject the flag).
+            let _ = SetConsoleMode(stdout, CONSOLE_MODE(raw_out));
         }
     }
 
