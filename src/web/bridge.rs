@@ -10,7 +10,7 @@
 //! requests go through `spawn_blocking`, data-pipe I/O uses plain threads, and
 //! [`Attachment::shutdown`] moves its teardown onto the blocking pool.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -183,11 +183,13 @@ fn expect_ok(response: Response, action: &str) -> anyhow::Result<()> {
 
 /// Names attached in this `smw` process.
 ///
-/// Cloning shares the same set, so an [`Attachment`] can release its slot even
-/// though `attach` only receives a shared reference.
+/// Cloning shares the same map, so an [`Attachment`] can release its slot even
+/// though `attach` only receives a shared reference. Each slot also carries a
+/// takeover flag so a new browser tab can ask the current attachment to stand
+/// down.
 #[derive(Clone, Default)]
 pub struct AttachRegistry {
-    names: Arc<Mutex<HashSet<String>>>,
+    names: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl AttachRegistry {
@@ -195,10 +197,29 @@ impl AttachRegistry {
         Self::default()
     }
 
-    /// Claim `name`. Returns false when it is already attached.
-    pub fn try_acquire(&self, name: &str) -> bool {
+    /// Claim `name`, returning the takeover flag for the new attachment.
+    /// Returns `None` when it is already attached.
+    pub fn try_acquire(&self, name: &str) -> Option<Arc<AtomicBool>> {
         let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
-        names.insert(name.to_string())
+        if names.contains_key(name) {
+            return None;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        names.insert(name.to_string(), flag.clone());
+        Some(flag)
+    }
+
+    /// Ask the attachment currently holding `name` to disconnect. Returns false
+    /// when nobody holds it.
+    pub fn kick(&self, name: &str) -> bool {
+        let names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+        match names.get(name) {
+            Some(flag) => {
+                flag.store(true, Ordering::Release);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn release(&self, name: &str) {
@@ -350,6 +371,7 @@ pub struct Attachment {
     reader_done: Arc<AtomicBool>,
     writer_tid: Arc<AtomicU32>,
     writer_done: Arc<AtomicBool>,
+    takeover: Arc<AtomicBool>,
     registry: AttachRegistry,
 }
 
@@ -366,6 +388,11 @@ impl Attachment {
             .as_ref()
             .expect("attachment already shut down")
             .clone()
+    }
+
+    /// Flag set when another browser tab asks this attachment to stand down.
+    pub fn takeover_flag(&self) -> Arc<AtomicBool> {
+        self.takeover.clone()
     }
 
     /// Tear the attachment down: stop both threads, close the pipes and release
@@ -504,22 +531,37 @@ pub async fn attach(
     rows: u16,
     takeover: bool,
 ) -> Result<Attachment, AttachError> {
-    if !registry.try_acquire(name) {
-        return Err(AttachError::Busy);
+    if takeover {
+        // Ask an in-process attachment to stand down, detach any console
+        // client, then give the daemon a moment to see the pipe handles close
+        // before we try to open them.
+        registry.kick(name);
+        let _ = control.detach(name).await;
+        tokio::time::sleep(TAKEOVER_GRACE).await;
     }
+
+    let mut takeover_flag = registry.try_acquire(name);
+    if takeover && takeover_flag.is_none() {
+        // The previous browser connection may still be tearing down. Keep
+        // signalling it and retry briefly.
+        for _ in 0..40 {
+            registry.kick(name);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(flag) = registry.try_acquire(name) {
+                takeover_flag = Some(flag);
+                break;
+            }
+        }
+    }
+    let Some(takeover_flag) = takeover_flag else {
+        return Err(AttachError::Busy);
+    };
 
     // Release the slot on every failure path after this point.
     let fail = |error: AttachError| {
         registry.release(name);
         error
     };
-
-    if takeover {
-        // Ask the previous client to disconnect, then give the daemon a moment
-        // to see the pipe handles close before we try to open them.
-        let _ = control.detach(name).await;
-        tokio::time::sleep(TAKEOVER_GRACE).await;
-    }
 
     // Attach only; creating a missing session is the HTTP layer's job (POST).
     let response = match control.continue_session(name, cols, rows).await {
@@ -586,6 +628,7 @@ pub async fn attach(
         reader_done,
         writer_tid,
         writer_done,
+        takeover: takeover_flag,
         registry: registry.clone(),
     })
 }
@@ -704,13 +747,16 @@ mod tests {
     #[test]
     fn registry_is_exclusive_per_name() {
         let registry = AttachRegistry::new();
-        assert!(registry.try_acquire("alpha"));
-        assert!(!registry.try_acquire("alpha"));
-        assert!(registry.try_acquire("beta"));
+        assert!(registry.try_acquire("alpha").is_some());
+        assert!(registry.try_acquire("alpha").is_none());
+        let beta = registry.try_acquire("beta").expect("beta is free");
+        assert!(!registry.kick("missing"));
+        assert!(registry.kick("beta"));
+        assert!(beta.load(Ordering::Acquire));
 
         registry.release("alpha");
-        assert!(registry.try_acquire("alpha"));
-        assert!(!registry.try_acquire("beta"));
+        assert!(registry.try_acquire("alpha").is_some());
+        assert!(registry.try_acquire("beta").is_none());
     }
 
     #[test]
@@ -718,11 +764,22 @@ mod tests {
         let registry = AttachRegistry::new();
         let clone = registry.clone();
 
-        assert!(registry.try_acquire("alpha"));
-        assert!(!clone.try_acquire("alpha"));
+        assert!(registry.try_acquire("alpha").is_some());
+        assert!(clone.try_acquire("alpha").is_none());
 
         clone.release("alpha");
-        assert!(registry.try_acquire("alpha"));
+        assert!(registry.try_acquire("alpha").is_some());
+    }
+
+    #[test]
+    fn kick_targets_only_the_named_attachment() {
+        let registry = AttachRegistry::new();
+        let alpha = registry.try_acquire("alpha").expect("alpha is free");
+        let beta = registry.try_acquire("beta").expect("beta is free");
+
+        assert!(registry.kick("alpha"));
+        assert!(alpha.load(Ordering::Acquire));
+        assert!(!beta.load(Ordering::Acquire));
     }
 
     #[test]

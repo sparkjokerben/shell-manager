@@ -14,6 +14,7 @@ use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::error::TrySendError;
 
 use shell_manager::log;
@@ -267,9 +268,25 @@ async fn handle_socket(
     });
 
     let input = attachment.input_sender();
+    let takeover = attachment.takeover_flag();
+    let mut takeover_tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    takeover_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = takeover_tick.tick() => {
+                if takeover.load(Ordering::Acquire) {
+                    send_json(
+                        &mut socket,
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "该会话已被另一个网页终端接管",
+                        }),
+                    )
+                    .await;
+                    break;
+                }
+            }
             event = attachment.output_receiver().recv() => {
                 match event {
                     Some(OutputEvent::Data(bytes)) => {
@@ -278,19 +295,12 @@ async fn handle_socket(
                         }
                     }
                     Some(OutputEvent::Exit(message)) => {
-                        send_json(
-                            &mut socket,
-                            serde_json::json!({ "type": "exit", "message": message }),
-                        )
-                        .await;
+                        send_termination(&mut socket, &takeover, message).await;
                         break;
                     }
                     None => {
-                        send_json(
-                            &mut socket,
-                            serde_json::json!({ "type": "exit", "message": "session ended" }),
-                        )
-                        .await;
+                        send_termination(&mut socket, &takeover, "session ended".to_string())
+                            .await;
                         break;
                     }
                 }
@@ -359,6 +369,22 @@ async fn handle_socket(
 
 async fn send_json(socket: &mut WebSocket, value: serde_json::Value) {
     let _ = socket.send(Message::Text(value.to_string())).await;
+}
+
+/// Tell the browser why its terminal ended.
+///
+/// A kicked attachment often sees the data pipe fail before the takeover tick
+/// fires, so the flag decides which story the user gets.
+async fn send_termination(socket: &mut WebSocket, takeover: &AtomicBool, message: String) {
+    let value = if takeover.load(Ordering::Acquire) {
+        serde_json::json!({
+            "type": "error",
+            "message": "该会话已被另一个网页终端接管",
+        })
+    } else {
+        serde_json::json!({ "type": "exit", "message": message })
+    };
+    send_json(socket, value).await;
 }
 
 // ---------------------------------------------------------------------------
