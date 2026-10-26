@@ -13,8 +13,11 @@ use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use shell_manager::log;
@@ -32,6 +35,19 @@ pub const DEFAULT_ROWS: u16 = 40;
 
 /// Highest accepted terminal dimension.
 pub const MAX_DIM: u16 = 1000;
+
+/// Upper bound on one WebSocket message. A terminal paste is tiny compared to
+/// this; the limit keeps a hostile or buggy client from allocating gigabytes
+/// in the input queue.
+const MAX_WS_MESSAGE: usize = 1024 * 1024;
+
+/// Bound on one WebSocket send. A peer that stopped reading must not pin the
+/// attachment (and its registry slot) forever.
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outbound message queue. Sends happen in a dedicated task so the terminal
+/// loop never blocks on a dead TCP connection.
+const WS_QUEUE_CAPACITY: usize = 64;
 
 /// Body of `POST /api/sessions`.
 #[derive(Debug, Clone, Deserialize)]
@@ -208,7 +224,10 @@ async fn ws_handler(
         ),
     );
 
-    upgrade.on_upgrade(move |socket| handle_socket(socket, state, name, cols, rows, takeover))
+    upgrade
+        .max_message_size(MAX_WS_MESSAGE)
+        .max_frame_size(MAX_WS_MESSAGE)
+        .on_upgrade(move |socket| handle_socket(socket, state, name, cols, rows, takeover))
 }
 
 async fn handle_socket(
@@ -231,15 +250,17 @@ async fn handle_socket(
                         "attach failed name={} status={} error={}",
                         name,
                         status.as_u16(),
-                        message
+                        error
                     ),
                 );
-                send_json(
-                    &mut socket,
-                    serde_json::json!({ "type": "error", "message": message }),
+                let value = serde_json::json!({ "type": "error", "message": message });
+                let _ = tokio::time::timeout(
+                    WS_SEND_TIMEOUT,
+                    socket.send(Message::Text(value.to_string())),
                 )
                 .await;
-                let _ = socket.send(Message::Close(None)).await;
+                let _ =
+                    tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(Message::Close(None))).await;
                 return;
             }
         };
@@ -249,13 +270,39 @@ async fn handle_socket(
         &format!("attach name={} mouse={}", name, attachment.mouse),
     );
 
+    let takeover = attachment.takeover_flag();
+    let mut status = attachment.status_receiver();
+    let input = attachment.input_sender();
+
+    let (mut sink, mut stream) = socket.split();
+    let (send_tx, mut send_rx) = mpsc::channel::<Message>(WS_QUEUE_CAPACITY);
+    let mut writer = tokio::spawn(async move {
+        while let Some(message) = send_rx.recv().await {
+            if tokio::time::timeout(WS_SEND_TIMEOUT, sink.send(message))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        // A close frame makes an intentional detach a normal closure (1005)
+        // instead of an abnormal one.
+        let _ = tokio::time::timeout(WS_SEND_TIMEOUT, sink.close()).await;
+    });
+
     let ready = serde_json::json!({
         "type": "ready",
         "name": name,
         "mouse": attachment.mouse,
         "instance": state.instance,
     });
-    if socket.send(Message::Text(ready.to_string())).await.is_err() {
+    if send_tx
+        .send(Message::Text(ready.to_string()))
+        .await
+        .is_err()
+    {
+        drop(send_tx);
+        let _ = writer.await;
         attachment.shutdown().await;
         return;
     }
@@ -263,49 +310,54 @@ async fn handle_socket(
     // A full repaint is a control request; never block the message loop on it.
     let repaint_control = state.control.clone();
     let repaint_name = name.clone();
+    let repaint_flag = takeover.clone();
     tokio::spawn(async move {
-        bridge::force_repaint(&repaint_control, &repaint_name, cols, rows).await;
+        bridge::force_repaint(&repaint_control, &repaint_name, cols, rows, &repaint_flag).await;
     });
 
-    let input = attachment.input_sender();
-    let takeover = attachment.takeover_flag();
-    let mut takeover_tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    let mut takeover_tick = tokio::time::interval(Duration::from_millis(200));
     takeover_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = takeover_tick.tick() => {
                 if takeover.load(Ordering::Acquire) {
-                    send_json(
-                        &mut socket,
-                        serde_json::json!({
-                            "type": "error",
-                            "message": "该会话已被另一个网页终端接管",
-                        }),
-                    )
-                    .await;
+                    queue_termination(&send_tx, true, String::new());
                     break;
                 }
             }
             event = attachment.output_receiver().recv() => {
                 match event {
                     Some(OutputEvent::Data(bytes)) => {
-                        if socket.send(Message::Binary(bytes)).await.is_err() {
+                        if send_tx.try_send(Message::Binary(bytes)).is_err() {
                             break;
                         }
                     }
                     Some(OutputEvent::Exit(message)) => {
-                        send_termination(&mut socket, &takeover, message).await;
+                        queue_termination(&send_tx, takeover.load(Ordering::Acquire), message);
                         break;
                     }
                     None => {
-                        send_termination(&mut socket, &takeover, "session ended".to_string())
-                            .await;
+                        queue_termination(
+                            &send_tx,
+                            takeover.load(Ordering::Acquire),
+                            "session ended".to_string(),
+                        );
                         break;
                     }
                 }
             }
-            incoming = socket.recv() => {
+            changed = status.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let message = status.borrow().clone();
+                if let Some(message) = message {
+                    queue_termination(&send_tx, takeover.load(Ordering::Acquire), message);
+                    break;
+                }
+            }
+            incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Binary(bytes))) => {
                         match input.try_send(bytes) {
@@ -313,14 +365,13 @@ async fn handle_socket(
                             // Slow client: drop the connection instead of
                             // blocking the pipe and stalling the session.
                             Err(TrySendError::Full(_)) => {
-                                send_json(
-                                    &mut socket,
+                                let _ = send_tx.try_send(Message::Text(
                                     serde_json::json!({
                                         "type": "error",
                                         "message": "input backlog exceeded; detached",
-                                    }),
-                                )
-                                .await;
+                                    })
+                                    .to_string(),
+                                ));
                                 break;
                             }
                             Err(TrySendError::Closed(_)) => break,
@@ -331,17 +382,25 @@ async fn handle_socket(
                             Some(ClientMessage::Resize { cols, rows }) => {
                                 let cols = clamp_dim(cols);
                                 let rows = clamp_dim(rows);
-                                // A failed resize is reported but does not end
-                                // the terminal.
-                                if let Err(error) = state.control.resize(&name, cols, rows).await {
-                                    let message = format!("resize failed: {}", error);
-                                    log(&state, &format!("resize failed name={} error={}", name, message));
-                                    send_json(
-                                        &mut socket,
-                                        serde_json::json!({ "type": "error", "message": message }),
-                                    )
-                                    .await;
-                                }
+                                // Control requests may take seconds when the
+                                // daemon is busy; keep draining the terminal.
+                                let resize_state = state.clone();
+                                let resize_name = name.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) = resize_state
+                                        .control
+                                        .resize(&resize_name, cols, rows)
+                                        .await
+                                    {
+                                        log(
+                                            &resize_state,
+                                            &format!(
+                                                "resize failed name={} error={}",
+                                                resize_name, error
+                                            ),
+                                        );
+                                    }
+                                });
                             }
                             Some(ClientMessage::Detach) => break,
                             None => {}
@@ -355,28 +414,26 @@ async fn handle_socket(
         }
     }
 
-    // Send a close frame before tearing down: dropping the socket after an
-    // intentional detach would otherwise surface as an abnormal closure in the
-    // browser.
-    let _ = socket.send(Message::Close(None)).await;
-
-    // Drop the writer handle before `shutdown` joins the writer thread;
-    // otherwise `blocking_recv` could keep it alive indefinitely.
+    // Stop queueing output and let the writer flush the terminal message and
+    // close frame. Tear the attachment down in parallel so the registry slot is
+    // released even when the peer is unreachable.
+    drop(send_tx);
     drop(input);
-    attachment.shutdown().await;
+    let flush = async {
+        if tokio::time::timeout(WS_SEND_TIMEOUT, &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+        }
+    };
+    tokio::join!(flush, attachment.shutdown());
     log(&state, &format!("detach name={}", name));
 }
 
-async fn send_json(socket: &mut WebSocket, value: serde_json::Value) {
-    let _ = socket.send(Message::Text(value.to_string())).await;
-}
-
-/// Tell the browser why its terminal ended.
-///
-/// A kicked attachment often sees the data pipe fail before the takeover tick
-/// fires, so the flag decides which story the user gets.
-async fn send_termination(socket: &mut WebSocket, takeover: &AtomicBool, message: String) {
-    let value = if takeover.load(Ordering::Acquire) {
+/// Queue a final message and let the writer close the socket.
+fn queue_termination(tx: &mpsc::Sender<Message>, taken_over: bool, message: String) {
+    let value = if taken_over {
         serde_json::json!({
             "type": "error",
             "message": "该会话已被另一个网页终端接管",
@@ -384,7 +441,7 @@ async fn send_termination(socket: &mut WebSocket, takeover: &AtomicBool, message
     } else {
         serde_json::json!({ "type": "exit", "message": message })
     };
-    send_json(socket, value).await;
+    let _ = tx.try_send(Message::Text(value.to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -423,11 +480,10 @@ pub fn attach_error_message(error: &AttachError) -> String {
     match error {
         AttachError::Busy => "该会话已被本进程的另一个网页终端占用".to_string(),
         AttachError::Control(message) => message.clone(),
-        AttachError::Pipe(message) if is_pipe_timeout(message) => format!(
-            "{}(可能被 sm 或其他客户端占用，可尝试强制接管 takeover=1)",
-            message
-        ),
-        AttachError::Pipe(message) => message.clone(),
+        AttachError::Pipe(message) if is_pipe_timeout(message) => {
+            "连接会话数据管道超时（可能被其他客户端占用，可尝试强制接管）".to_string()
+        }
+        AttachError::Pipe(_) => "无法打开会话的数据管道".to_string(),
     }
 }
 
@@ -446,6 +502,9 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     }
     if name.contains('/') || name.contains('\\') {
         return Err("session name must not contain slashes".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("session name must not be . or ..".to_string());
     }
     Ok(())
 }
@@ -491,11 +550,10 @@ fn asset_response(path: &str) -> Response {
             } else {
                 "public, max-age=31536000, immutable"
             };
-            Response::builder()
+            auth::with_security_headers(Response::builder())
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime)
                 .header(header::CACHE_CONTROL, cache)
-                .header("X-Content-Type-Options", "nosniff")
                 .body(Body::from(bytes))
                 .expect("static response is well formed")
         }
@@ -523,10 +581,9 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response {
     let body = serde_json::to_vec(&value).expect("JSON values serialize");
-    Response::builder()
+    auth::with_security_headers(Response::builder())
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .header("X-Content-Type-Options", "nosniff")
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(body))
         .expect("JSON response is well formed")
@@ -598,13 +655,20 @@ mod tests {
     fn attach_messages_explain_busy_and_pipe_timeouts() {
         assert!(attach_error_message(&AttachError::Busy).contains("另一个网页终端"));
         let pipe = attach_error_message(&AttachError::Pipe(
-            "timed out connecting to data pipe x".into(),
+            "timed out connecting to data pipe \\\\.\\pipe\\shell-manager\\data\\uuid\\out".into(),
         ));
-        assert!(pipe.contains("timed out connecting to data pipe"));
+        assert!(pipe.contains("超时"));
         assert!(pipe.contains("强制接管"));
+        // Internal pipe names and session ids must not reach the browser.
+        assert!(!pipe.contains("pipe"));
+        assert!(!pipe.contains("uuid"));
         assert_eq!(
             attach_error_message(&AttachError::Control("boom".into())),
             "boom"
+        );
+        assert_eq!(
+            attach_error_message(&AttachError::Pipe("access denied".into())),
+            "无法打开会话的数据管道"
         );
     }
 
@@ -623,6 +687,8 @@ mod tests {
         assert!(validate_name("bad\u{7}name").is_err());
         assert!(validate_name("bad/name").is_err());
         assert!(validate_name(r"bad\name").is_err());
+        assert!(validate_name(".").is_err());
+        assert!(validate_name("..").is_err());
     }
 
     #[test]

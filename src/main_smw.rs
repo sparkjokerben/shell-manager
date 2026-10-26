@@ -16,8 +16,10 @@ usage: smw [options]
 options:
   --bind <addr>       address to listen on (default: 127.0.0.1)
   --port <port>       TCP port to listen on (default: 8787)
-  --token <token>     API token (default: $SMW_TOKEN)
+  --token <token>     API token (default: $SMW_TOKEN; never pass secrets in
+                      shell history on a shared machine)
   --instance <name>   instance namespace (overrides $SM_INSTANCE)
+  --allow-insecure    allow a non-loopback bind without a token (dangerous)
   -h, --help          show this help
   -V, --version       show the version
 environment:
@@ -36,6 +38,8 @@ pub struct Config {
     pub port: u16,
     pub token: Option<String>,
     pub instance: String,
+    /// True when the listener only accepts loopback connections.
+    pub loopback_only: bool,
 }
 
 /// Raw command-line values, before the instance namespace is applied.
@@ -45,6 +49,7 @@ struct Raw {
     port: u16,
     token: Option<String>,
     instance: Option<String>,
+    allow_insecure: bool,
     help: bool,
     version: bool,
 }
@@ -75,8 +80,15 @@ fn parse(args: &[String]) -> Result<Raw, String> {
                     .parse()
                     .map_err(|_| format!("invalid --port: {}", value))?;
             }
-            "--token" => raw.token = Some(next_value(args, &mut i, "--token")?),
+            "--token" => {
+                let value = next_value(args, &mut i, "--token")?;
+                if value.is_empty() {
+                    return Err("--token must not be empty (omit it to disable auth)".to_string());
+                }
+                raw.token = Some(value);
+            }
             "--instance" => raw.instance = Some(next_value(args, &mut i, "--instance")?),
+            "--allow-insecure" => raw.allow_insecure = true,
             "-h" | "--help" => raw.help = true,
             "-V" | "--version" => raw.version = true,
             other if other.starts_with('-') => {
@@ -112,9 +124,10 @@ fn apply_instance(raw: Option<&str>) -> String {
 }
 
 /// Token from `--token`, else from `SMW_TOKEN`; an empty value means "off".
-fn resolve_token(raw: Option<String>) -> Option<String> {
-    raw.or_else(|| std::env::var("SMW_TOKEN").ok())
-        .filter(|token| !token.is_empty())
+///
+/// The environment value is passed in so tests never mutate process-wide state.
+fn resolve_token(raw: Option<String>, env: Option<String>) -> Option<String> {
+    raw.or(env).filter(|token| !token.is_empty())
 }
 
 /// Record the startup settings in `%TEMP%\smw-<instance>.log`.
@@ -135,13 +148,35 @@ fn log_startup(config: &Config) {
     );
 }
 
+/// Whether `bind` only accepts loopback connections.
+///
+/// A hostname other than `localhost` is treated as non-loopback: it needs a
+/// token even if DNS currently resolves it to 127.0.0.1.
+fn is_loopback_bind(bind: &str) -> bool {
+    if bind.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    bind.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Format a host and port, bracketing IPv6 literals.
+fn listen_address(bind: &str, port: u16) -> String {
+    if bind.contains(':') && !bind.starts_with('[') {
+        format!("[{}]:{}", bind, port)
+    } else {
+        format!("{}:{}", bind, port)
+    }
+}
+
 /// Bind the listener, print the effective address and serve until the process
 /// is interrupted.
 ///
 /// Ctrl-C terminates the process outright; the data-pipe handles close with it
 /// and the hosted shell keeps running.
 async fn serve(config: Config) -> anyhow::Result<()> {
-    let address = format!("{}:{}", config.bind, config.port);
+    let address = listen_address(&config.bind, config.port);
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {}: {}", address, e))?;
@@ -154,6 +189,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         registry: AttachRegistry::new(),
         token: config.token.clone().map(Arc::new),
         instance: config.instance.clone(),
+        loopback_only: config.loopback_only,
     };
     let router = web::http::router(state);
 
@@ -201,12 +237,30 @@ fn main() {
         return;
     }
 
+    let loopback_only = is_loopback_bind(&raw.bind);
     let config = Config {
         bind: raw.bind,
         port: raw.port,
-        token: resolve_token(raw.token),
+        token: resolve_token(raw.token, std::env::var("SMW_TOKEN").ok()),
         instance,
+        loopback_only,
     };
+
+    if !config.loopback_only && config.token.is_none() && !raw.allow_insecure {
+        eprintln!(
+            "refusing to listen on non-loopback {} without a token; \
+             set --token or SMW_TOKEN, or pass --allow-insecure to override",
+            config.bind
+        );
+        std::process::exit(1);
+    }
+    if config.token.is_none() {
+        eprintln!(
+            "warning: no token configured. Any local process or user that can reach \
+             http://{} can control sessions; set SMW_TOKEN on shared machines.",
+            listen_address(&config.bind, config.port)
+        );
+    }
 
     log_startup(&config);
 
@@ -278,6 +332,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_token_is_rejected_instead_of_disabling_auth() {
+        assert!(parse(&args(&["--token", ""])).is_err());
+    }
+
+    #[test]
+    fn allow_insecure_is_parsed() {
+        assert!(parse(&args(&["--allow-insecure"])).unwrap().allow_insecure);
+    }
+
+    #[test]
+    fn loopback_binds_are_recognised() {
+        for bind in ["127.0.0.1", "127.1.2.3", "::1", "localhost", "LOCALHOST"] {
+            assert!(is_loopback_bind(bind), "{}", bind);
+        }
+        for bind in ["0.0.0.0", "::", "192.168.1.5", "example.com", ""] {
+            assert!(!is_loopback_bind(bind), "{}", bind);
+        }
+    }
+
+    #[test]
+    fn ipv6_listen_addresses_are_bracketed() {
+        assert_eq!(listen_address("127.0.0.1", 8787), "127.0.0.1:8787");
+        assert_eq!(listen_address("::1", 8787), "[::1]:8787");
+        assert_eq!(listen_address("[::1]", 8787), "[::1]:8787");
+    }
+
+    #[test]
     fn unknown_options_and_positionals_are_rejected() {
         assert!(parse(&args(&["--bogus"]))
             .unwrap_err()
@@ -297,20 +378,22 @@ mod tests {
 
     #[test]
     fn empty_token_means_disabled() {
-        assert_eq!(resolve_token(None), None);
-        assert_eq!(resolve_token(Some(String::new())), None);
-        assert_eq!(resolve_token(Some("abc".into())), Some("abc".into()));
+        assert_eq!(resolve_token(None, None), None);
+        assert_eq!(resolve_token(Some(String::new()), None), None);
+        assert_eq!(resolve_token(Some(String::new()), Some("env".into())), None);
+        assert_eq!(resolve_token(Some("abc".into()), None), Some("abc".into()));
     }
 
     #[test]
     fn token_falls_back_to_the_environment() {
-        // `std::env::set_var` is process-wide; use a value no other test reads.
-        std::env::set_var("SMW_TOKEN", "from-env");
-        assert_eq!(resolve_token(None), Some("from-env".into()));
         assert_eq!(
-            resolve_token(Some("explicit".into())),
+            resolve_token(None, Some("from-env".into())),
+            Some("from-env".into())
+        );
+        assert_eq!(
+            resolve_token(Some("explicit".into()), Some("from-env".into())),
             Some("explicit".into())
         );
-        std::env::remove_var("SMW_TOKEN");
+        assert_eq!(resolve_token(None, Some(String::new())), None);
     }
 }

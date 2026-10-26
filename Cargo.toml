@@ -2,6 +2,7 @@
 name = "shell-manager"
 version = "0.1.1"
 edition = "2021"
+rust-version = "1.89"
 description = "Persistent Windows shells that survive SSH disconnects (ConPTY + named pipes)"
 license = "MIT"
 repository = "https://github.com/sparkjokerben/shell-manager"
@@ -42,4 +43,5 @@ anyhow = "1.0"
 ctrlc = "3.4"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+futures-util = "0.3"
 include_dir = "0.7"

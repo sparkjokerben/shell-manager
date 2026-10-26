@@ -305,12 +305,24 @@ pub fn write_all_pipe(pipe: HANDLE, data: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Closes a Win32 handle when dropped, so every error path in
+/// [`pipe_request`] releases it.
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 /// Send a JSON request over a named pipe and read a JSON response.
 ///
 /// Wire format: 4-byte little-endian length prefix, then UTF-8 JSON payload.
 pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::FILE_SHARE_MODE;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, OPEN_EXISTING, SECURITY_SQOS_PRESENT, SECURITY_IDENTIFICATION,
@@ -359,10 +371,12 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
         }
     };
 
+    let h = OwnedHandle(h);
+
     // Set pipe to byte mode
     unsafe {
         let mut mode: NAMED_PIPE_MODE = PIPE_READMODE_BYTE | PIPE_WAIT;
-        SetNamedPipeHandleState(h, Some(&mut mode), None, None)?;
+        SetNamedPipeHandleState(h.0, Some(&mut mode), None, None)?;
     }
 
     let payload = serde_json::to_vec(req)?;
@@ -379,11 +393,11 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
     let mut buf = Vec::with_capacity(4 + payload_len as usize);
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.extend_from_slice(&payload);
-    write_all_pipe(h, &buf)?;
+    write_all_pipe(h.0, &buf)?;
 
     // Read length prefix (4 bytes).
     let mut len_buf = [0u8; 4];
-    read_exact_pipe(h, &mut len_buf)?;
+    read_exact_pipe(h.0, &mut len_buf)?;
     let resp_len = u32::from_le_bytes(len_buf) as usize;
     if resp_len > MAX_RESPONSE_BYTES {
         anyhow::bail!(
@@ -394,11 +408,7 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
     }
 
     let mut resp_buf = vec![0u8; resp_len];
-    read_exact_pipe(h, &mut resp_buf)?;
-
-    unsafe {
-        CloseHandle(h).context("CloseHandle failed")?;
-    }
+    read_exact_pipe(h.0, &mut resp_buf)?;
 
     let resp: Response = serde_json::from_slice(&resp_buf)?;
     Ok(resp)

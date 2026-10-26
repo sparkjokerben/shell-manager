@@ -22,4 +22,7 @@ pub struct AppState {
     pub registry: AttachRegistry,
     pub token: Option<Arc<String>>,
     pub instance: String,
+    /// True when the listener is bound to a loopback address. Used to reject
+    /// DNS-rebinding requests while the server runs without a token.
+    pub loopback_only: bool,
 }

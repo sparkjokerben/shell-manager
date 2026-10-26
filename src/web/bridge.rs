@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use shell_manager::protocol::{self, Op, Request, Response, SessionInfo};
 use tokio::sync::mpsc::{self, error::TrySendError, Receiver, Sender};
+use tokio::sync::watch;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -26,6 +27,16 @@ use windows::Win32::Storage::FileSystem::{
 
 /// Capacity of the per-attachment output event channel (and the input queue).
 pub const OUTPUT_CHANNEL_CAPACITY: usize = 256;
+
+/// Capacity of the browser-to-session input queue. Kept small because one
+/// WebSocket message may be up to 1 MiB and a stuck writer would otherwise
+/// retain hundreds of megabytes.
+pub const INPUT_CHANNEL_CAPACITY: usize = 32;
+
+/// How long a single control-pipe request may take before the caller gives up.
+/// The daemon serialises control requests, and a stuck daemon must not pin an
+/// HTTP handler (or the attachment slot) forever.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Size of one read from the data `out` pipe.
 const READ_CHUNK: usize = 8 * 1024;
@@ -70,11 +81,16 @@ impl ControlClient {
     /// Send one request and wait for its response.
     pub async fn request(&self, req: Request) -> anyhow::Result<Response> {
         let _guard = self.gate.lock().await;
-        let response = tokio::task::spawn_blocking(move || {
+        let task = tokio::task::spawn_blocking(move || {
             protocol::pipe_request(protocol::control_pipe(), &req)
-        })
-        .await??;
-        Ok(response)
+        });
+        match tokio::time::timeout(CONTROL_TIMEOUT, task).await {
+            Ok(joined) => Ok(joined??),
+            Err(_) => anyhow::bail!(
+                "control request timed out after {}s (is smd responsive?)",
+                CONTROL_TIMEOUT.as_secs()
+            ),
+        }
     }
 
     pub async fn list(&self) -> anyhow::Result<Vec<SessionInfo>> {
@@ -372,6 +388,9 @@ pub struct Attachment {
     writer_tid: Arc<AtomicU32>,
     writer_done: Arc<AtomicBool>,
     takeover: Arc<AtomicBool>,
+    /// Fatal I/O notification from the reader or writer thread. A `watch`
+    /// channel keeps the handler informed even when the output queue is full.
+    status: watch::Receiver<Option<String>>,
     registry: AttachRegistry,
 }
 
@@ -393,6 +412,11 @@ impl Attachment {
     /// Flag set when another browser tab asks this attachment to stand down.
     pub fn takeover_flag(&self) -> Arc<AtomicBool> {
         self.takeover.clone()
+    }
+
+    /// Fatal I/O notifications from the pipe threads.
+    pub fn status_receiver(&self) -> watch::Receiver<Option<String>> {
+        self.status.clone()
     }
 
     /// Tear the attachment down: stop both threads, close the pipes and release
@@ -522,6 +546,39 @@ impl BlockingParts {
     }
 }
 
+/// Releases the attachment slot unless ownership moves to an [`Attachment`].
+///
+/// `attach` has several await points after claiming the slot. If the future is
+/// dropped (runtime shutdown, caller cancellation) the guard releases it;
+/// `disarm` hands the slot to the returned attachment instead.
+struct SlotGuard {
+    registry: AttachRegistry,
+    name: String,
+    armed: bool,
+}
+
+impl SlotGuard {
+    fn new(registry: &AttachRegistry, name: &str) -> Self {
+        Self {
+            registry: registry.clone(),
+            name: name.to_string(),
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.release(&self.name);
+        }
+    }
+}
+
 /// Open the data pipes and start the I/O threads.
 pub async fn attach(
     control: &ControlClient,
@@ -543,8 +600,8 @@ pub async fn attach(
     let mut takeover_flag = registry.try_acquire(name);
     if takeover && takeover_flag.is_none() {
         // The previous browser connection may still be tearing down. Keep
-        // signalling it and retry briefly.
-        for _ in 0..40 {
+        // signalling it and retry; teardown is bounded at roughly five seconds.
+        for _ in 0..100 {
             registry.kick(name);
             tokio::time::sleep(Duration::from_millis(50)).await;
             if let Some(flag) = registry.try_acquire(name) {
@@ -556,45 +613,41 @@ pub async fn attach(
     let Some(takeover_flag) = takeover_flag else {
         return Err(AttachError::Busy);
     };
-
-    // Release the slot on every failure path after this point.
-    let fail = |error: AttachError| {
-        registry.release(name);
-        error
-    };
+    let slot = SlotGuard::new(registry, name);
 
     // Attach only; creating a missing session is the HTTP layer's job (POST).
     let response = match control.continue_session(name, cols, rows).await {
         Ok(response) => response,
-        Err(e) => return Err(fail(AttachError::Control(e.to_string()))),
+        Err(e) => return Err(AttachError::Control(e.to_string())),
     };
     if !response.ok {
-        return Err(fail(AttachError::Control(response.error)));
+        return Err(AttachError::Control(response.error));
     }
 
     let (pipe_out, pipe_in, mouse) = match extract_pipes(&response.data) {
         Some(parts) => parts,
         None => {
-            return Err(fail(AttachError::Control(
+            return Err(AttachError::Control(
                 "control response did not include data pipe names".to_string(),
-            )))
+            ))
         }
     };
 
     let out_handle = match open_pipe_async(pipe_out, GENERIC_READ.0).await {
         Ok(handle) => HandleSlot::new(handle),
-        Err(e) => return Err(fail(AttachError::Pipe(e.to_string()))),
+        Err(e) => return Err(AttachError::Pipe(e.to_string())),
     };
     let in_handle = match open_pipe_async(pipe_in, GENERIC_WRITE.0).await {
         Ok(handle) => HandleSlot::new(handle),
         Err(e) => {
             out_handle.close();
-            return Err(fail(AttachError::Pipe(e.to_string())));
+            return Err(AttachError::Pipe(e.to_string()));
         }
     };
 
     let (out_tx, out_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
-    let (in_tx, in_rx) = mpsc::channel(OUTPUT_CHANNEL_CAPACITY);
+    let (in_tx, in_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+    let (status_tx, status_rx) = watch::channel(None::<String>);
 
     let reader_tid = Arc::new(AtomicU32::new(0));
     let reader_done = Arc::new(AtomicBool::new(false));
@@ -606,16 +659,17 @@ pub async fn attach(
         out_tx.clone(),
         reader_tid.clone(),
         reader_done.clone(),
+        status_tx.clone(),
     );
     let writer = spawn_writer(
         in_handle.clone(),
         in_rx,
-        out_tx,
         writer_tid.clone(),
         writer_done.clone(),
+        status_tx,
     );
 
-    Ok(Attachment {
+    let attachment = Attachment {
         name: name.to_string(),
         mouse,
         out_rx: Some(out_rx),
@@ -629,8 +683,11 @@ pub async fn attach(
         writer_tid,
         writer_done,
         takeover: takeover_flag,
+        status: status_rx,
         registry: registry.clone(),
-    })
+    };
+    slot.disarm();
+    Ok(attachment)
 }
 
 fn extract_pipes(data: &Option<serde_json::Value>) -> Option<(String, String, u8)> {
@@ -644,12 +701,25 @@ fn extract_pipes(data: &Option<serde_json::Value>) -> Option<(String, String, u8
     Some((pipe_out, pipe_in, mouse))
 }
 
+/// Report a fatal reader condition through both the event queue and the
+/// status watch. The queue may be full (it is usually why the reader is
+/// stopping), so the watch channel is the reliable path.
+fn finish_reader(
+    status: &watch::Sender<Option<String>>,
+    events: &Sender<OutputEvent>,
+    message: String,
+) {
+    let _ = status.send(Some(message.clone()));
+    let _ = events.try_send(OutputEvent::Exit(message));
+}
+
 /// Data `out` pipe -> `OutputEvent` channel.
 fn spawn_reader(
     handle: HandleSlot,
     events: Sender<OutputEvent>,
     tid: Arc<AtomicU32>,
     done: Arc<AtomicBool>,
+    status: watch::Sender<Option<String>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let current = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
@@ -664,7 +734,7 @@ fn spawn_reader(
             let result = unsafe { ReadFile(pipe, Some(&mut buf), Some(&mut read), None) };
             match result {
                 Ok(()) if read == 0 => {
-                    let _ = events.try_send(OutputEvent::Exit("session ended".to_string()));
+                    finish_reader(&status, &events, "session ended".to_string());
                     break;
                 }
                 Ok(()) => {
@@ -674,17 +744,21 @@ fn spawn_reader(
                         // The browser is not keeping up. Detach rather than
                         // block the pipe, which would stall the session.
                         Err(TrySendError::Full(_)) => {
-                            let _ = events.try_send(OutputEvent::Exit(
+                            finish_reader(
+                                &status,
+                                &events,
                                 "output backlog exceeded; detached".to_string(),
-                            ));
+                            );
                             break;
                         }
-                        Err(TrySendError::Closed(_)) => break,
+                        Err(TrySendError::Closed(_)) => {
+                            let _ = status.send(Some("session ended".to_string()));
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
-                    let _ =
-                        events.try_send(OutputEvent::Exit(format!("output read failed: {}", e)));
+                    finish_reader(&status, &events, format!("output read failed: {}", e));
                     break;
                 }
             }
@@ -699,9 +773,9 @@ fn spawn_reader(
 fn spawn_writer(
     handle: HandleSlot,
     mut input: Receiver<Vec<u8>>,
-    events: Sender<OutputEvent>,
     tid: Arc<AtomicU32>,
     done: Arc<AtomicBool>,
+    status: watch::Sender<Option<String>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let current = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
@@ -714,7 +788,7 @@ fn spawn_writer(
                 break;
             };
             if let Err(e) = protocol::write_all_pipe(pipe, &data) {
-                let _ = events.try_send(OutputEvent::Exit(format!("session input failed: {}", e)));
+                let _ = status.send(Some(format!("session input failed: {}", e)));
                 break;
             }
         }
@@ -730,13 +804,26 @@ fn spawn_writer(
 /// one row and restore it. The pause between the two is essential: sent back to
 /// back, the app can see only the final size and skip the redraw, which leaves
 /// the last line of a TUI untouched.
-pub async fn force_repaint(control: &ControlClient, name: &str, cols: u16, rows: u16) {
+pub async fn force_repaint(
+    control: &ControlClient,
+    name: &str,
+    cols: u16,
+    rows: u16,
+    abort: &AtomicBool,
+) {
     if rows < 2 {
+        let _ = control.resize(name, cols, rows.max(1)).await;
         return;
     }
     tokio::time::sleep(Duration::from_millis(120)).await;
+    if abort.load(Ordering::Acquire) {
+        return;
+    }
     let _ = control.resize(name, cols, rows - 1).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
+    if abort.load(Ordering::Acquire) {
+        return;
+    }
     let _ = control.resize(name, cols, rows).await;
 }
 
