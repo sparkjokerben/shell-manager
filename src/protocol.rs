@@ -1,11 +1,21 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use windows::Win32::Foundation::HANDLE;
 
 /// IPC control pipe path shared between the sm client and smd.
 pub const CONTROL_PIPE: &str = r"\\.\pipe\shell-manager\control";
 
 /// Data pipe prefix: \\.\pipe\shell-manager\data\<session_id>
 pub const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-manager\data";
+
+/// Upper bound on a control-pipe request body (1 MiB).
+///
+/// The daemon allocates a buffer of the announced length, so a bogus or
+/// truncated length prefix must be rejected before allocating.
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Upper bound on a control-pipe response body (16 MiB).
+pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -71,6 +81,55 @@ pub fn is_pipe_connected(result: &windows::core::Result<()>) -> bool {
     }
 }
 
+/// Read exactly `buf.len()` bytes from a pipe.
+///
+/// Pipes in byte mode may return fewer bytes than requested even when blocking,
+/// so a single `ReadFile` is not enough. A zero-byte read means the peer closed
+/// the pipe and is reported as an error rather than silently truncating.
+pub fn read_exact_pipe(pipe: HANDLE, buf: &mut [u8]) -> anyhow::Result<()> {
+    use windows::Win32::Storage::FileSystem::ReadFile;
+
+    let mut pos = 0;
+    while pos < buf.len() {
+        let mut read: u32 = 0;
+        unsafe { ReadFile(pipe, Some(&mut buf[pos..]), Some(&mut read), None) }
+            .context("ReadFile failed")?;
+        if read == 0 {
+            anyhow::bail!(
+                "pipe closed while reading ({} of {} bytes read)",
+                pos,
+                buf.len()
+            );
+        }
+        pos += read as usize;
+    }
+    Ok(())
+}
+
+/// Write the whole buffer to a pipe, looping over short writes.
+///
+/// A `WriteFile` that reports zero bytes written is treated as an error so a
+/// broken peer fails loudly instead of spinning.
+pub fn write_all_pipe(pipe: HANDLE, data: &[u8]) -> anyhow::Result<()> {
+    use windows::Win32::Storage::FileSystem::WriteFile;
+
+    let mut pos = 0;
+    while pos < data.len() {
+        let mut written: u32 = 0;
+        unsafe { WriteFile(pipe, Some(&data[pos..]), Some(&mut written), None) }
+            .context("WriteFile failed")?;
+        if written == 0 {
+            anyhow::bail!(
+                "pipe write made no progress ({} of {} bytes written)",
+                pos,
+                data.len()
+            );
+        }
+        pos += written as usize;
+    }
+    Ok(())
+}
+
 /// Send a JSON request over a named pipe and read a JSON response.
 ///
 /// Wire format: 4-byte little-endian length prefix, then UTF-8 JSON payload.
@@ -80,7 +139,6 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
     use windows::Win32::Storage::FileSystem::FILE_SHARE_MODE;
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, OPEN_EXISTING, SECURITY_SQOS_PRESENT, SECURITY_IDENTIFICATION,
-        ReadFile, WriteFile,
     };
     use windows::Win32::System::Pipes::{
         PIPE_READMODE_BYTE, PIPE_WAIT, NAMED_PIPE_MODE, SetNamedPipeHandleState, WaitNamedPipeW,
@@ -133,52 +191,35 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
     }
 
     let payload = serde_json::to_vec(req)?;
+    if payload.len() > MAX_REQUEST_BYTES {
+        anyhow::bail!(
+            "request too large: {} bytes (limit {} bytes)",
+            payload.len(),
+            MAX_REQUEST_BYTES
+        );
+    }
     let payload_len = payload.len() as u32;
 
-    // Write length prefix (4 bytes LE) then payload
+    // Write length prefix (4 bytes LE) then payload.
     let mut buf = Vec::with_capacity(4 + payload_len as usize);
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.extend_from_slice(&payload);
+    write_all_pipe(h, &buf)?;
 
-    let mut written: u32 = 0;
-    unsafe {
-        WriteFile(
-            h,
-            Some(&buf),
-            Some(&mut written),
-            None,
-        )
-        .context("WriteFile failed")?;
-    }
-
-    // Read length prefix (4 bytes)
+    // Read length prefix (4 bytes).
     let mut len_buf = [0u8; 4];
-    let mut read: u32 = 0;
-    unsafe {
-        ReadFile(
-            h,
-            Some(&mut len_buf),
-            Some(&mut read),
-            None,
-        )
-        .context("ReadFile length failed")?;
-    }
-    if read < 4 {
-        anyhow::bail!("short read on response length");
-    }
+    read_exact_pipe(h, &mut len_buf)?;
     let resp_len = u32::from_le_bytes(len_buf) as usize;
+    if resp_len > MAX_RESPONSE_BYTES {
+        anyhow::bail!(
+            "response too large: {} bytes (limit {} bytes)",
+            resp_len,
+            MAX_RESPONSE_BYTES
+        );
+    }
 
     let mut resp_buf = vec![0u8; resp_len];
-    let mut read: u32 = 0;
-    unsafe {
-        ReadFile(
-            h,
-            Some(&mut resp_buf),
-            Some(&mut read),
-            None,
-        )
-        .context("ReadFile payload failed")?;
-    }
+    read_exact_pipe(h, &mut resp_buf)?;
 
     unsafe {
         CloseHandle(h).context("CloseHandle failed")?;
@@ -186,4 +227,70 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
 
     let resp: Response = serde_json::from_slice(&resp_buf)?;
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::WriteFile;
+    use windows::Win32::System::Pipes::CreatePipe;
+
+    fn anonymous_pipe() -> (HANDLE, HANDLE) {
+        let mut read_end = HANDLE::default();
+        let mut write_end = HANDLE::default();
+        unsafe { CreatePipe(&mut read_end, &mut write_end, None, 0) }.expect("CreatePipe");
+        (read_end, write_end)
+    }
+
+    fn write_chunk(pipe: HANDLE, data: &[u8]) {
+        let mut written = 0u32;
+        unsafe { WriteFile(pipe, Some(data), Some(&mut written), None) }.expect("WriteFile");
+        assert_eq!(written as usize, data.len());
+    }
+
+    /// Reads may return fewer bytes than requested even in blocking mode; the
+    /// helper must keep reading until the buffer is full.
+    #[test]
+    fn read_exact_pipe_loops_over_short_reads() {
+        let (read_end, write_end) = anonymous_pipe();
+
+        // Prime the pipe with a short first chunk, then feed the rest later so
+        // the first ReadFile is guaranteed to be a short read.
+        write_chunk(write_end, b"ab");
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            write_chunk(write_end, b"cdefghi");
+        });
+
+        let mut buf = [0u8; 9];
+        read_exact_pipe(read_end, &mut buf).expect("read_exact_pipe");
+        assert_eq!(&buf, b"abcdefghi");
+
+        writer.join().unwrap();
+        unsafe {
+            let _ = CloseHandle(write_end);
+            let _ = CloseHandle(read_end);
+        }
+    }
+
+    /// A peer that closes without sending all promised bytes must be an error,
+    /// not a truncated success.
+    #[test]
+    fn read_exact_pipe_errors_when_pipe_closes_early() {
+        let (read_end, write_end) = anonymous_pipe();
+        write_chunk(write_end, b"ab");
+        unsafe {
+            let _ = CloseHandle(write_end);
+        }
+
+        let mut buf = [0u8; 4];
+        assert!(read_exact_pipe(read_end, &mut buf).is_err());
+
+        unsafe {
+            let _ = CloseHandle(read_end);
+        }
+    }
 }

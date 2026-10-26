@@ -2,19 +2,21 @@
 //!
 //! Maintains a session table and serves control-pipe requests (START / CONTINUE / LIST / STOP).
 
-use crate::protocol::{Op, Request, Response, SessionInfo};
+use crate::protocol::{
+    read_exact_pipe, write_all_pipe, Op, Request, Response, SessionInfo, CONTROL_PIPE,
+    MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+};
 use crate::session::{Session, SessionState};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+use windows::Win32::Storage::FileSystem::{FlushFileBuffers, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::{
     CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe,
     PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_WAIT,
     PIPE_UNLIMITED_INSTANCES, NMPWAIT_WAIT_FOREVER,
 };
-use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 
 /// Shared session table: session name -> Session.
 type SessionTable = Arc<Mutex<HashMap<String, Session>>>;
@@ -27,8 +29,6 @@ pub struct Daemon {
     last: LastSession,
     control_pipe: HANDLE,
 }
-
-const CONTROL_PIPE: &str = r"\\.\pipe\shell-manager\control";
 
 impl Daemon {
     pub fn new() -> Result<Self> {
@@ -71,6 +71,13 @@ impl Daemon {
         loop {
             let connected = unsafe { crate::protocol::is_pipe_connected(&ConnectNamedPipe(self.control_pipe, None)) };
             if !connected {
+                // A failed ConnectNamedPipe (e.g. ERROR_NO_DATA) leaves this
+                // instance unusable, so disconnect before retrying. Back off to
+                // avoid spinning at 100% CPU on a persistent error.
+                unsafe {
+                    let _ = DisconnectNamedPipe(self.control_pipe);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
 
@@ -88,57 +95,65 @@ impl Daemon {
 fn handle_control_connection(pipe: HANDLE, sessions: SessionTable, last: LastSession) -> Result<()> {
     // Read length prefix (4 bytes LE).
     let mut len_buf = [0u8; 4];
-    let mut read: u32 = 0;
-    unsafe {
-        ReadFile(
-            pipe,
-            Some(&mut len_buf),
-            Some(&mut read),
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("ReadFile failed: {}", e))?;
+    if let Err(e) = read_exact_pipe(pipe, &mut len_buf) {
+        // The client may already be gone; a failed error report must not mask
+        // the original failure.
+        let _ = write_response(pipe, &Response::err(format!("failed to read request length: {:#}", e)));
+        return Err(e).context("failed to read request length");
     }
-    if read < 4 {
-        anyhow::bail!("short read on request length");
-    }
+
     let req_len = u32::from_le_bytes(len_buf) as usize;
+    if req_len > MAX_REQUEST_BYTES {
+        // Reject before allocating: a bogus prefix must not let a local process
+        // make smd reserve gigabytes.
+        let msg = format!(
+            "request too large: {} bytes (limit {} bytes)",
+            req_len, MAX_REQUEST_BYTES
+        );
+        let _ = write_response(pipe, &Response::err(&msg));
+        anyhow::bail!("{}", msg);
+    }
 
     let mut req_buf = vec![0u8; req_len];
-    unsafe {
-        ReadFile(
-            pipe,
-            Some(&mut req_buf),
-            Some(&mut read),
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("ReadFile failed: {}", e))?;
+    if let Err(e) = read_exact_pipe(pipe, &mut req_buf) {
+        let _ = write_response(pipe, &Response::err(format!("failed to read request body: {:#}", e)));
+        return Err(e).context("failed to read request body");
     }
 
-    let req: Request = serde_json::from_slice(&req_buf)
-        .context("failed to parse request JSON")?;
+    let req: Request = match serde_json::from_slice(&req_buf) {
+        Ok(req) => req,
+        Err(e) => {
+            let _ = write_response(pipe, &Response::err(format!("failed to parse request JSON: {}", e)));
+            return Err(e).context("failed to parse request JSON");
+        }
+    };
 
     let response = dispatch(&req, &sessions, &last);
+    write_response(pipe, &response)?;
+    Ok(())
+}
 
-    let payload = serde_json::to_vec(&response)?;
+/// Serialize and write one response, then flush it before the caller disconnects.
+fn write_response(pipe: HANDLE, response: &Response) -> Result<()> {
+    let payload = serde_json::to_vec(response)?;
+    if payload.len() > MAX_RESPONSE_BYTES {
+        anyhow::bail!(
+            "response too large: {} bytes (limit {} bytes)",
+            payload.len(),
+            MAX_RESPONSE_BYTES
+        );
+    }
+
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(&payload);
 
-    let mut written: u32 = 0;
-    unsafe {
-        WriteFile(
-            pipe,
-            Some(&buf),
-            Some(&mut written),
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("WriteFile failed: {}", e))?;
-    }
+    write_all_pipe(pipe, &buf)?;
 
     // Ensure the response is delivered before the caller disconnects the pipe;
     // otherwise DisconnectNamedPipe may discard buffered data the client hasn't read yet.
     unsafe {
-        windows::Win32::Storage::FileSystem::FlushFileBuffers(pipe)
+        FlushFileBuffers(pipe)
             .map_err(|e| anyhow::anyhow!("FlushFileBuffers failed: {}", e))?;
     }
 
@@ -402,6 +417,43 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.control_pipe);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Storage::FileSystem::WriteFile;
+    use windows::Win32::System::Pipes::CreatePipe;
+
+    /// An announced request length above the cap must be rejected before any
+    /// body buffer is allocated, and must not block waiting for the body.
+    #[test]
+    fn oversized_request_length_is_rejected() {
+        let mut read_end = HANDLE::default();
+        let mut write_end = HANDLE::default();
+        unsafe { CreatePipe(&mut read_end, &mut write_end, None, 0) }.expect("CreatePipe");
+
+        let len = (MAX_REQUEST_BYTES as u32 + 1).to_le_bytes();
+        let mut written = 0u32;
+        unsafe { WriteFile(write_end, Some(&len), Some(&mut written), None) }.expect("WriteFile");
+        assert_eq!(written, 4);
+
+        let sessions: SessionTable = Arc::new(Mutex::new(HashMap::new()));
+        let last: LastSession = Arc::new(Mutex::new(None));
+
+        let err = handle_control_connection(read_end, sessions, last)
+            .expect_err("oversized request length must be rejected");
+        assert!(
+            err.to_string().contains("request too large"),
+            "unexpected error: {:#}",
+            err
+        );
+
+        unsafe {
+            let _ = CloseHandle(write_end);
+            let _ = CloseHandle(read_end);
         }
     }
 }
