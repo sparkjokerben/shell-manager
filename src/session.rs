@@ -747,7 +747,7 @@ mod tests {
     /// program producing more than one pipe buffer blocks and never finishes.
     #[test]
     fn detached_program_is_not_blocked() {
-        let marker = std::env::temp_dir().join(format!("sd-drain-{}.txt", std::process::id()));
+        let marker = std::env::temp_dir().join(format!("sp-drain-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&marker);
 
         let session = Session::new("unit-drain", 80, 25, "cmd.exe").unwrap();

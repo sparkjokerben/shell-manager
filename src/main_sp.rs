@@ -25,13 +25,13 @@ use shell_persistence::session::{for_each_mouse_mode, mouse_bit};
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: sd <start|continue|detach|list|stop> <name> [--wsl]");
+        eprintln!("usage: sp <start|continue|detach|list|stop> <name> [--wsl]");
         std::process::exit(1);
     }
     match args[1].as_str() {
         "start" => {
             if args.len() < 3 {
-                eprintln!("usage: sd start <name> [--wsl]");
+                eprintln!("usage: sp start <name> [--wsl]");
                 std::process::exit(1);
             }
             let name = args[2].clone();
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
         }
         "continue" => {
             if args.len() < 3 {
-                eprintln!("usage: sd continue <name>");
+                eprintln!("usage: sp continue <name>");
                 std::process::exit(1);
             }
             let name = args[2].clone();
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
         }
         "detach" => {
             if args.len() < 3 {
-                eprintln!("usage: sd detach <name>");
+                eprintln!("usage: sp detach <name>");
                 std::process::exit(1);
             }
             let name = args[2].clone();
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
         }
         "stop" => {
             if args.len() < 3 {
-                eprintln!("usage: sd stop <name>");
+                eprintln!("usage: sp stop <name>");
                 std::process::exit(1);
             }
             let name = args[2].clone();
@@ -622,7 +622,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
             let _ = SetConsoleOutputCP(65001);
         }
     } else {
-        eprintln!("[sd] no console detected; forwarding without raw mode");
+        eprintln!("[sp] no console detected; forwarding without raw mode");
     }
 
     // Attaching silently keeps a running TUI's screen intact: any line printed

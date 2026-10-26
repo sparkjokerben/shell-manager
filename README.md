@@ -54,7 +54,7 @@ cd shell-persistence
 
 ```text
 sp start <name>            # create a session and attach to it
-sp start --wsl <name>      # host wsl.exe instead of PowerShell
+sp start <name> --wsl      # host wsl.exe instead of PowerShell
 sp continue <name>         # reattach to an existing session
 sp list                    # sessions and their attach state
 sp detach <name>           # disconnect the attached client, keep the shell

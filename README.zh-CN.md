@@ -51,7 +51,7 @@ cd shell-persistence
 
 ```text
 sp start <名字>            # 新建会话并附着
-sp start --wsl <名字>      # 托管 wsl.exe 而不是 PowerShell
+sp start <名字> --wsl      # 托管 wsl.exe 而不是 PowerShell
 sp continue <名字>         # 重新附着一个已有会话
 sp list                    # 列出会话与附着状态
 sp detach <名字>           # 断开当前客户端，shell 保持运行
