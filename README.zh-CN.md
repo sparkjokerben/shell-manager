@@ -10,8 +10,8 @@
 
 `sm` 是你敲命令的客户端，`smd` 是常驻后台的小守护进程。守护进程持有一个由
 Windows 伪终端（ConPTY）托管的 shell：关掉 SSH 窗口、网络断开，或者主动脱附，
-shell 都继续跑；重新连上后 `sm continue <名字>` 就回到同一个 shell，回滚缓冲、
-正在运行的程序、工作目录全都还在。
+shell 都继续跑；重新连上后 `sm continue <名字>` 就回到同一个 shell，正在运行的
+程序和工作目录都还在，当前屏幕会重绘。
 
 被托管的 shell 使用你自己的注册表环境变量（额外设置 `TERM=xterm-256color`，
 这与伪终端的实际能力一致），所以 oh-my-posh 之类的配置照常渲染。
@@ -30,8 +30,8 @@ shell 都继续跑；重新连上后 `sm continue <名字>` 就回到同一个 s
 ## 安装
 
 从 [Releases](https://github.com/sparkjokerben/shell-manager/releases) 下载
-`shell-manager-vX.Y.Z-x64.zip`，把 `sm.exe` 与 `smd.exe` 放到 `PATH` 里的目录
-（例如 `%USERPROFILE%\bin`）。
+`shell-manager-vX.Y.Z-x64.zip`，把 `sm.exe`、`smd.exe` 以及网页终端用的
+`smw.exe` 放到 `PATH` 里的目录（例如 `%USERPROFILE%\bin`）。
 
 守护进程必须运行在**交互桌面会话**里——ConPTY 的子进程继承守护进程的会话，而且
 只有交互桌面才能承载 GUI 窗口：
@@ -43,7 +43,7 @@ schtasks /run /tn smd
 
 更简单的做法：把 `smd.exe` 的快捷方式放进 `shell:startup`。
 
-从源码构建会同时安装两个可执行文件并注册登录任务：
+从源码构建会构建前端、安装全部三个可执行文件，并为 `smd` 注册登录任务：
 
 ```powershell
 git clone https://github.com/sparkjokerben/shell-manager
@@ -71,6 +71,113 @@ sm start <名字> --wsl      # 只新建（已存在则报错），托管 wsl.ex
 脱附时如果有程序正在运行（编译、测试、Claude Code 这类 TUI），它不会中断：守护
 进程在没有客户端时仍持续排空伪终端输出，程序不会因为输出管道写满而卡死；重新
 附着时客户端会让应用整屏重绘。
+
+## 网页终端（Web UI）
+
+`smw` 是可选的第三个二进制，在同一个守护进程之上提供浏览器终端：
+
+```text
+浏览器 ── smw.exe（HTTP/WebSocket）── 命名管道协议 ── smd.exe ── ConPTY
+```
+
+它不改变 `smd` 或现有协议，使用的命名管道与 `sm` 相同。前端是
+Vite + React + TypeScript + xterm.js 应用，静态资源在编译时整体内嵌进
+`smw.exe`。
+
+前端构建产物不提交仓库，因此编译 `smw` 前要先构建前端。不构建时
+`cargo build` 仍能成功，但 `smw` 只会提供一张提示“前端未构建”的占位页：
+
+```powershell
+cd web
+npm ci
+npm run build
+cd ..
+cargo build --release --bin smw
+```
+
+前端有任何改动都要重新编译 `smw`，因为整个 `web/dist` 目录是在编译时内嵌的。
+
+以与 `smd` 相同的 Windows 用户启动桥接进程（`smw` 本身不要求交互桌面），然后
+打开 <http://127.0.0.1:8787>：
+
+```text
+> smw
+smw 0.1.1 instance=prod listening on http://127.0.0.1:8787 (token off)
+```
+
+选项：
+
+```text
+smw [--bind <地址>] [--port <端口>] [--token <令牌>] [--instance <名字>] [-h] [-V]
+  --bind <地址>      监听地址（默认：127.0.0.1）
+  --port <端口>      监听端口（默认：8787）
+  --token <令牌>     API 令牌（默认取 $SMW_TOKEN）
+  --instance <名字>  实例命名空间（覆盖 $SM_INSTANCE）
+  -h, --help         显示帮助
+  -V, --version      显示版本
+```
+
+实例规则与 `sm`/`smd` 相同：`SM_INSTANCE` 选择命名空间，位于本项目 `target/`
+目录下的可执行文件自动使用 `dev`。`smw` 连接的是同一命名空间里的守护进程。
+
+浏览器看到的就是 `sm` 使用的那些会话。关闭标签页或点击 Detach 等同于脱附，
+shell 继续运行；“强制接管”（Force takeover）会先断开当前附着的客户端，再让
+浏览器接入。
+
+JSON API 与客户端命令一一对应：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/health` | 存活状态、实例、版本、是否设置了令牌 |
+| GET | `/api/sessions` | 会话列表及其附着状态 |
+| POST | `/api/sessions` | 新建会话（`{"name": "...", "wsl": false}`） |
+| POST | `/api/sessions/{name}/detach` | 让当前附着的客户端脱附 |
+| DELETE | `/api/sessions/{name}` | 销毁会话及其 shell |
+| GET | `/ws/{name}` | 该会话的 WebSocket 终端 |
+
+### 安全
+
+默认没有令牌时所有请求都会被接受，这只有在 `smw` 仅监听 `127.0.0.1` 时才是
+安全的。用 `--token` 或 `SMW_TOKEN` 设置令牌后，HTTP 请求需要
+`Authorization: Bearer <令牌>` 或 `X-SMW-Token: <令牌>`，WebSocket 升级还可以
+使用 `?token=`。静态页与 `/api/health` 不需要令牌，以便浏览器先加载页面并
+得知是否需要认证。浏览器 WebSocket 无法自定义请求头，所以令牌会出现在 URL
+查询串里；请把这个 URL 当作秘密保管。
+
+不要把没有令牌的 `smw` 暴露到本机之外。用 `--bind 0.0.0.0` 绑定或转发端口
+属于使用者的责任。
+
+### frp
+
+`smw` 可以搭配 [frp](https://github.com/fatedier/frp) 使用。在本机运行 `frpc`，
+把本地端口转发到你的 `frps`：
+
+```toml
+# frpc.toml
+serverAddr = "frps.example.com"
+serverPort = 7000
+
+[[proxies]]
+name = "smw"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8787
+remotePort = 18787
+```
+
+公网部署必须设置令牌（`--token` 或 `SMW_TOKEN`），并且建议在 `frps` 侧启用
+TLS（`frps.toml` 中的 `transport.tls`），让终端流量加密传输。不要转发没有
+令牌的 `smw` 端口。
+
+### 限制
+
+- **同一会话同时只允许一个客户端。** 原生 `sm` 附着与网页终端互斥：一方附着
+  时，另一方会看到会话忙，直到对方脱附或被强制接管。
+- **重连只恢复当前屏。** ConPTY 重绘的是应用主动重画的内容，脱附期间产生的
+  输出不会作为历史回滚缓冲保留。
+- **必须使用同一个 Windows 用户。** `smw` 与 `smd` 要在同一账户下运行；命名
+  管道使用默认 DACL，其他用户无法打开。
+- **`smd` 仍须运行在交互桌面会话中**，与使用 `sm` 时完全一致。
 
 ## 开发实例隔离
 

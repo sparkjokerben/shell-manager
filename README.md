@@ -12,7 +12,7 @@ Persistent Windows shells that survive SSH disconnects.
 owns a shell hosted in a Windows pseudo console (ConPTY). Close the SSH window,
 lose the connection, or detach on purpose - the shell keeps running. Reconnect
 and `sm continue <name>` puts you back in front of the same shell, with its
-scrollback, running programs and working directory intact.
+running programs and working directory intact and its current screen redrawn.
 
 The hosted shell starts with your own registry environment (plus
 `TERM=xterm-256color`, which describes the pseudo console accurately), so
@@ -33,7 +33,8 @@ sessions cannot host PowerShell or anything that needs the Windows desktop.
 
 Download `shell-manager-vX.Y.Z-x64.zip` from
 [Releases](https://github.com/sparkjokerben/shell-manager/releases), then
-put `sm.exe` and `smd.exe` somewhere on `PATH` (for example `%USERPROFILE%\bin`).
+put `sm.exe`, `smd.exe` and (for the browser UI) `smw.exe` somewhere on `PATH`
+(for example `%USERPROFILE%\bin`).
 
 Start the daemon in your interactive desktop session - it must live there,
 because ConPTY children inherit its session and only the interactive desktop can
@@ -46,7 +47,8 @@ schtasks /run /tn smd
 
 Simpler alternative: place a shortcut to `smd.exe` in `shell:startup`.
 
-Building from source installs both binaries and registers the logon task:
+Building from source builds the web UI, installs all three binaries and
+registers the logon task for `smd`:
 
 ```powershell
 git clone https://github.com/sparkjokerben/shell-manager
@@ -77,6 +79,122 @@ If a command is running while you detach (a build, a test suite, a TUI such as
 Claude Code), it keeps running: the daemon keeps draining the pseudo console so
 the program never blocks on a full output pipe, and a reattach repaints the
 whole screen.
+
+## Web UI
+
+`smw` is an optional third binary that puts a terminal in the browser on top of
+the same daemon:
+
+```text
+browser ── smw.exe (HTTP/WebSocket) ── named-pipe protocol ── smd.exe ── ConPTY
+```
+
+It does not change `smd` or the existing protocol; it speaks the same named
+pipes as `sm`. The frontend is a Vite + React + TypeScript + xterm.js app, and
+its static files are embedded into `smw.exe` at compile time.
+
+The frontend build is not committed, so build it before compiling `smw`. A plain
+`cargo build` still succeeds without it, but `smw` then serves only a
+placeholder page that says the UI is missing:
+
+```powershell
+cd web
+npm ci
+npm run build
+cd ..
+cargo build --release --bin smw
+```
+
+Rebuild `smw` after any frontend change, because the whole `web/dist` directory
+is embedded at compile time.
+
+Start the bridge under the same Windows user as `smd` - `smw` itself does not
+need the interactive desktop - then open <http://127.0.0.1:8787>:
+
+```text
+> smw
+smw 0.1.1 instance=prod listening on http://127.0.0.1:8787 (token off)
+```
+
+Options:
+
+```text
+smw [--bind <addr>] [--port <port>] [--token <token>] [--instance <name>] [-h] [-V]
+  --bind <addr>      address to listen on (default: 127.0.0.1)
+  --port <port>      TCP port to listen on (default: 8787)
+  --token <token>    API token (default: $SMW_TOKEN)
+  --instance <name>  instance namespace (overrides $SM_INSTANCE)
+  -h, --help         show help
+  -V, --version      show the version
+```
+
+The instance rules match `sm`/`smd`: `SM_INSTANCE` selects a namespace, and an
+executable under this project's `target/` directory automatically uses `dev`.
+`smw` talks to the daemon in the same namespace.
+
+The browser sees the same sessions as `sm`. Closing the tab or pressing Detach
+detaches the client and leaves the shell running; Force takeover first
+disconnects whichever client is attached, then connects the browser.
+
+The JSON API mirrors the client commands:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/health` | liveness, instance, version, whether a token is set |
+| GET | `/api/sessions` | sessions and their attach state |
+| POST | `/api/sessions` | create a session (`{"name": "...", "wsl": false}`) |
+| POST | `/api/sessions/{name}/detach` | detach the attached client |
+| DELETE | `/api/sessions/{name}` | stop the session and its shell |
+| GET | `/ws/{name}` | WebSocket terminal for that session |
+
+### Security
+
+Without a token every request is accepted, which is only safe because `smw`
+listens on `127.0.0.1` by default. Set a token with `--token` or `SMW_TOKEN` to
+require authentication. Then HTTP requests need `Authorization: Bearer <token>`
+or `X-SMW-Token: <token>`, and WebSocket upgrades also accept `?token=`. The
+static page and `/api/health` stay public so the browser can load the UI and
+learn whether a token is configured. Browser WebSocket clients cannot send
+custom headers, so the token appears in the URL query string; treat that URL as
+a secret.
+
+Never expose a tokenless `smw` beyond the local machine. Binding with
+`--bind 0.0.0.0` or forwarding the port is your responsibility.
+
+### frp
+
+`smw` works behind [frp](https://github.com/fatedier/frp). Run `frpc` on the same
+machine and forward the local port to your `frps`:
+
+```toml
+# frpc.toml
+serverAddr = "frps.example.com"
+serverPort = 7000
+
+[[proxies]]
+name = "smw"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8787
+remotePort = 18787
+```
+
+A public deployment must set a token (`--token` or `SMW_TOKEN`), and you should
+enable TLS on the `frps` side (`transport.tls` in `frps.toml`) so the terminal
+traffic is encrypted. Do not forward a tokenless `smw` port.
+
+### Limitations
+
+- **One client per session.** A native `sm` attachment and a browser terminal
+  are mutually exclusive; while one is attached the other reports the session
+  as busy until it detaches or is taken over.
+- **Reconnecting restores the current screen only.** ConPTY repaints what the
+  application redraws, so output produced while detached is not kept as
+  scrollback history.
+- **Same Windows user.** `smw` and `smd` must run under the same account; the
+  named pipes use the default DACL, so another user cannot open them.
+- **`smd` must still live in the interactive desktop session**, exactly as it
+  does for `sm`.
 
 ## Development instances
 

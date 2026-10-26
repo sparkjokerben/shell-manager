@@ -14,6 +14,30 @@ param([switch]$RestartDaemon)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+# The web UI is embedded into smw.exe at compile time. Build it first so the
+# deployed smw serves the real frontend instead of the "not built" placeholder.
+$web = Join-Path $PSScriptRoot "web"
+if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+    throw "npm was not found on PATH; install Node.js (22 LTS or newer) to build the web UI for smw.exe"
+}
+$lockFile = Join-Path $web "package-lock.json"
+$installedLock = Join-Path $web "node_modules\.package-lock.json"
+$needsInstall = -not (Test-Path $installedLock)
+if (-not $needsInstall -and (Test-Path $lockFile)) {
+    # Reinstall when the lockfile changed since the last npm ci.
+    $needsInstall = (Get-Item $lockFile).LastWriteTimeUtc -gt (Get-Item $installedLock).LastWriteTimeUtc
+}
+if ($needsInstall) {
+    Write-Host "Installing web UI dependencies (npm ci)..."
+    & npm --prefix $web ci
+    if ($LASTEXITCODE -ne 0) { throw "npm ci failed in $web" }
+}
+Write-Host "Building web UI (npm run build)..."
+& npm --prefix $web run build
+if ($LASTEXITCODE -ne 0) {
+    throw "npm run build failed in $web; smw.exe would only serve a placeholder page"
+}
+
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
@@ -26,6 +50,16 @@ $sm = Join-Path $bin "sm.exe"
 if (Test-Path $sm) { Move-Item -Force $sm (Join-Path $bin "sm.old.exe") }
 Copy-Item "target\release\sm.exe" $sm -Force
 Write-Host "Client deployed to $bin"
+
+# Browser bridge. It is a service started on demand, so no logon task is
+# registered for it; replace a running image the same way as sm.exe.
+$smw = Join-Path $bin "smw.exe"
+if (Test-Path $smw) { Move-Item -Force $smw (Join-Path $bin "smw.old.exe") }
+Copy-Item "target\release\smw.exe" $smw -Force
+Write-Host "Web bridge deployed to $bin"
+Write-Host "smw is not started at logon. Start it manually, for example:"
+Write-Host "  smw --token <token>"
+Write-Host "then open http://127.0.0.1:8787 (the default bind address)."
 
 # Hidden launcher used by the logon task; it also pins the daemon's working
 # directory, which hosted shells inherit.
