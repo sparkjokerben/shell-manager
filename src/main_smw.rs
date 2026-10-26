@@ -1,12 +1,15 @@
 //! `smw`: browser-facing bridge to the smd daemon.
 //!
-//! This stage only parses the command line and reports the resolved settings.
-//! The HTTP server (and its auth layer) are added in a later stage on top of
-//! [`web::bridge`].
+//! Serves the embedded web UI, a small JSON API for session management and a
+//! WebSocket terminal per session, all on top of [`web::bridge`].
 
 mod web;
 
+use std::sync::Arc;
+
 use shell_manager::protocol;
+use web::bridge::{AttachRegistry, ControlClient};
+use web::AppState;
 
 const USAGE: &str = "\
 usage: smw [options]
@@ -132,6 +135,50 @@ fn log_startup(config: &Config) {
     );
 }
 
+/// Bind the listener, print the effective address and serve until the process
+/// is interrupted.
+///
+/// Ctrl-C terminates the process outright; the data-pipe handles close with it
+/// and the hosted shell keeps running.
+async fn serve(config: Config) -> anyhow::Result<()> {
+    let address = format!("{}:{}", config.bind, config.port);
+    let listener = tokio::net::TcpListener::bind(&address)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {}: {}", address, e))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| anyhow::anyhow!("failed to read the bound address: {}", e))?;
+
+    let state = AppState {
+        control: Arc::new(ControlClient::new()),
+        registry: AttachRegistry::new(),
+        token: config.token.clone().map(Arc::new),
+        instance: config.instance.clone(),
+    };
+    let router = web::http::router(state);
+
+    let token = if config.token.is_some() { "on" } else { "off" };
+    // `local` is the real address, which matters when `--port 0` was used.
+    println!(
+        "smw {} instance={} listening on http://{} (token {})",
+        env!("CARGO_PKG_VERSION"),
+        config.instance,
+        local,
+        token
+    );
+    shell_manager::log::write_to(
+        &protocol::smw_log_file(),
+        &format!(
+            "smw listening addr={} instance={} token={}",
+            local, config.instance, token
+        ),
+    );
+
+    axum::serve(listener, router)
+        .await
+        .map_err(|e| anyhow::anyhow!("server error: {}", e))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let raw = match parse(&args) {
@@ -161,17 +208,23 @@ fn main() {
         instance,
     };
 
-    // The HTTP server is wired up in a later stage; for now report the resolved
-    // settings so the CLI can be exercised on its own.
-    println!(
-        "smw {} instance={} bind={}:{} token={}",
-        env!("CARGO_PKG_VERSION"),
-        config.instance,
-        config.bind,
-        config.port,
-        if config.token.is_some() { "on" } else { "off" }
-    );
     log_startup(&config);
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("failed to start the async runtime: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = runtime.block_on(serve(config)) {
+        eprintln!("smw: {:#}", e);
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
