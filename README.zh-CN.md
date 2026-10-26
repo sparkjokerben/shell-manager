@@ -13,8 +13,8 @@ Windows 伪终端（ConPTY）托管的 shell：关掉 SSH 窗口、网络断开�
 shell 都继续跑；重新连上后 `sm continue <名字>` 就回到同一个 shell，回滚缓冲、
 正在运行的程序、工作目录全都还在。
 
-被托管的 shell 完全没有被改动：`pwsh.exe` / `wsl.exe` 照常启动，并使用你自己的
-注册表环境变量，所以 oh-my-posh 之类的配置照常渲染。
+被托管的 shell 使用你自己的注册表环境变量（额外设置 `TERM=xterm-256color`，
+这与伪终端的实际能力一致），所以 oh-my-posh 之类的配置照常渲染。
 
 ## 为什么需要它
 
@@ -107,6 +107,9 @@ cargo run --bin sm -- ls # 连接这个开发守护进程
 
 - `smd` 维护会话表，每个会话持有一个 ConPTY、shell 进程，以及两条单向命名管道
   （`out`、`in`）供附着的客户端使用。
+- 被托管的 shell 会看到 `TERM=xterm-256color`。ConPTY 本身就是 VT 终端，而依赖
+  该变量的程序（例如 Claude Code）据此决定渲染 `○`/`□`/`☒` 还是 ASCII 回退符号
+  （`()`/`[]`/`[x]`）。
 - 没有客户端附着时，排空线程持续读取伪终端输出，保证程序不会因管道写满而阻塞。
 - 重新附着时客户端把伪终端高度先减一、再恢复，触发应用整屏重绘。
 - shell 选择顺序：非打包版 PowerShell 7（Program Files 或用户级安装）→ `PATH`

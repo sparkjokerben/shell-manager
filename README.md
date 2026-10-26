@@ -14,9 +14,9 @@ lose the connection, or detach on purpose - the shell keeps running. Reconnect
 and `sm continue <name>` puts you back in front of the same shell, with its
 scrollback, running programs and working directory intact.
 
-The hosted shell is not modified in any way: `pwsh.exe` / `wsl.exe` start exactly
-as they always do, with your own registry environment, so profiles such as
-oh-my-posh render normally.
+The hosted shell starts with your own registry environment (plus
+`TERM=xterm-256color`, which describes the pseudo console accurately), so
+profiles such as oh-my-posh render normally.
 
 ## Why
 
@@ -115,6 +115,9 @@ terminal ── sm.exe ──┬── control pipe ──┐
 
 - `smd` keeps a table of sessions. Each session owns a ConPTY, the shell process
   and two unidirectional named pipes (`out`, `in`) for the attached client.
+- Hosted shells are told they run on `xterm-256color`. ConPTY is a VT terminal,
+  and Unicode-aware programs use that variable to decide whether to draw `○`,
+  `□` and `☒` or ASCII fallbacks such as `()`, `[]` and `[x]`.
 - While no client is attached, a drain thread keeps reading the PTY output, so a
   program writing to the console never blocks.
 - On reattach the client toggles the pseudo-console height (shrink one row, then

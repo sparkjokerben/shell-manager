@@ -1,20 +1,9 @@
 use shell_manager::pty::Pty;
 use std::time::{Duration, Instant};
 
-/// ConPTY must forward the sequences TUI apps rely on: 24-bit color and
-/// synchronized output. The payload also proves the child is really attached to
-/// the pseudo console rather than inheriting the host's redirected stdio.
-#[test]
-fn conpty_forwards_truecolor_and_sync_output() {
-    let file = std::env::temp_dir().join(format!("sd-conpty-test-{}.txt", std::process::id()));
-    let payload: &[u8] =
-        b"\x1b[38;2;12;34;56mTRUECOLOR\x1b[0m\r\n\x1b[?2026hSYNC-FRAME\x1b[?2026l\r\n";
-    std::fs::write(&file, payload).unwrap();
-
-    let mut pty = Pty::new(80, 25).unwrap();
-    pty.spawn(&format!("cmd.exe /c type \"{}\"", file.display())).unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(10);
+/// Read PTY output until the child exits and the stream has been quiet briefly.
+fn read_until_exit(pty: &Pty, timeout: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + timeout;
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 4096];
     let mut quiet_since = Instant::now();
@@ -36,6 +25,24 @@ fn conpty_forwards_truecolor_and_sync_output() {
             Err(_) => break,
         }
     }
+    out
+}
+
+/// ConPTY must forward the sequences TUI apps rely on: 24-bit color and
+/// synchronized output. The payload also proves the child is really attached to
+/// the pseudo console rather than inheriting the host's redirected stdio.
+#[test]
+fn conpty_forwards_truecolor_and_sync_output() {
+    let file = std::env::temp_dir().join(format!("sd-conpty-test-{}.txt", std::process::id()));
+    let payload: &[u8] =
+        b"\x1b[38;2;12;34;56mTRUECOLOR\x1b[0m\r\n\x1b[?2026hSYNC-FRAME\x1b[?2026l\r\n";
+    std::fs::write(&file, payload).unwrap();
+
+    let mut pty = Pty::new(80, 25).unwrap();
+    pty.spawn(&format!("cmd.exe /c type \"{}\"", file.display()))
+        .unwrap();
+
+    let out = read_until_exit(&pty, Duration::from_secs(10));
     let _ = std::fs::remove_file(&file);
 
     let text = String::from_utf8_lossy(&out);
@@ -52,6 +59,25 @@ fn conpty_forwards_truecolor_and_sync_output() {
     assert!(
         text.contains("\u{1b}[?2026h"),
         "synchronized output mode did not survive ConPTY: {:?}",
+        text
+    );
+}
+
+/// Unicode-aware programs decide on Windows whether the terminal can render
+/// Unicode by looking at `TERM`/`WT_SESSION`. A hosted shell that inherits only
+/// the registry environment has neither, so Claude Code and other TUIs replace
+/// symbols such as `○`, `□` and `☒` with ASCII fallbacks. The pseudo console is
+/// a VT terminal, so the child must be told that.
+#[test]
+fn conpty_child_sees_a_unicode_capable_terminal() {
+    let mut pty = Pty::new(80, 25).unwrap();
+    pty.spawn("cmd.exe /c echo TERM=%TERM%").unwrap();
+
+    let out = read_until_exit(&pty, Duration::from_secs(10));
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("TERM=xterm-256color"),
+        "child did not see a Unicode-capable terminal identity: {:?}",
         text
     );
 }

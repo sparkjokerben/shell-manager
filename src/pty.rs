@@ -5,53 +5,137 @@
 //! whose stdin/stdout/stderr are attached to a pseudo console.
 
 use anyhow::{Context, Result};
+use std::ffi::c_void;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use std::ffi::c_void;
-use windows::Win32::Foundation::{
-    CloseHandle, HANDLE,
-};
-use windows::Win32::System::Console::{
-    CreatePseudoConsole, ClosePseudoConsole, COORD, HPCON,
-    GetConsoleMode, GetStdHandle, SetStdHandle, CONSOLE_MODE,
-    STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-};
-use windows::Win32::System::Pipes::CreatePipe;
-use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
-use windows::Win32::System::Threading::{
-    EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW,
-    PROCESS_INFORMATION, CREATE_UNICODE_ENVIRONMENT,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESHOWWINDOW,
-    GetCurrentProcess, OpenProcessToken,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
-use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-use windows::Win32::System::Threading::{
-    InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
-    LPPROC_THREAD_ATTRIBUTE_LIST,
-};
 use windows::Win32::Storage::FileSystem::ReadFile;
+use windows::Win32::System::Console::{
+    ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetStdHandle, SetStdHandle,
+    CONSOLE_MODE, COORD, HPCON, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows::Win32::System::Pipes::CreatePipe;
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESHOWWINDOW, STARTUPINFOEXW,
+};
+use windows::Win32::System::Threading::{
+    InitializeProcThreadAttributeList, UpdateProcThreadAttribute, LPPROC_THREAD_ATTRIBUTE_LIST,
+};
+use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-/// Builds the user's own environment block (from the registry) for the child.
+/// Terminal identity advertised to the hosted child.
+///
+/// ConPTY is a real VT terminal, but a process started inside it inherits only
+/// the registry environment, where `TERM` is normally absent. Unicode-aware
+/// programs use `TERM` on Windows to decide whether the terminal can render
+/// Unicode; without it they replace symbols such as `○`, `□` and `☒` with
+/// ASCII fallbacks (`()`, `[]`, `[x]`). Claude Code's TUI checks exactly this,
+/// so declaring the pseudo console as an xterm-256color terminal is both
+/// accurate and what keeps those programs on the Unicode path.
+const TERM_ENTRY: &str = "TERM=xterm-256color";
+
+/// Builds the user's own environment block (from the registry) for the child,
+/// with the terminal identity added.
 ///
 /// Otherwise the shell inherits whatever environment the daemon happened to be
 /// started with - e.g. NO_COLOR and TERM from a parent terminal - which changes
 /// how tools such as oh-my-posh render.
-fn user_environment() -> Option<(*mut c_void, HANDLE)> {
+fn user_environment() -> Option<(Vec<u16>, HANDLE)> {
     unsafe {
         let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token).ok()?;
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut token,
+        )
+        .ok()?;
 
         let mut block: *mut c_void = ptr::null_mut();
         match CreateEnvironmentBlock(&mut block, token, false) {
-            Ok(()) if !block.is_null() => Some((block, token)),
+            Ok(()) if !block.is_null() => {
+                let raw = copy_environment_block(block as *const u16);
+                let _ = DestroyEnvironmentBlock(block);
+                Some((ensure_terminal_env(&raw), token))
+            }
             _ => {
                 let _ = CloseHandle(token);
                 None
             }
         }
     }
+}
+
+/// Copy a UTF-16 environment block up to and including its double-NUL end.
+///
+/// The length is not returned by `CreateEnvironmentBlock`; the block is
+/// terminated by an empty string followed by the block terminator.
+unsafe fn copy_environment_block(block: *const u16) -> Vec<u16> {
+    const LIMIT: usize = 1 << 20;
+    let mut len = 0usize;
+    while len + 1 < LIMIT {
+        if *block.add(len) == 0 && *block.add(len + 1) == 0 {
+            return std::slice::from_raw_parts(block, len + 2).to_vec();
+        }
+        len += 1;
+    }
+    Vec::new()
+}
+
+/// Return `block` with exactly one `TERM` entry, set to the pseudo console's
+/// terminal type.
+///
+/// Environment variable names are case-insensitive on Windows, so an existing
+/// `term=...` is replaced rather than duplicated. Other entries and the final
+/// double NUL stay intact.
+fn ensure_terminal_env(block: &[u16]) -> Vec<u16> {
+    let mut entries: Vec<&[u16]> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..block.len() {
+        if block[i] != 0 {
+            continue;
+        }
+        if i == start {
+            break; // the empty string that terminates the block
+        }
+        entries.push(&block[start..=i]);
+        start = i + 1;
+    }
+
+    let term: Vec<u16> = TERM_ENTRY.encode_utf16().chain(Some(0)).collect();
+    let mut out = Vec::with_capacity(block.len() + term.len());
+    let mut replaced = false;
+    for entry in entries {
+        if is_env_key(entry, "TERM") {
+            if !replaced {
+                out.extend_from_slice(&term);
+                replaced = true;
+            }
+            continue;
+        }
+        out.extend_from_slice(entry);
+    }
+    if !replaced {
+        out.extend_from_slice(&term);
+    }
+    out.push(0);
+    out
+}
+
+/// Whether a UTF-16 environment entry defines `key` (ASCII, case-insensitive).
+fn is_env_key(entry: &[u16], key: &str) -> bool {
+    for (i, expected) in key.bytes().enumerate() {
+        let Some(&actual) = entry.get(i) else {
+            return false;
+        };
+        if actual > 0x7f || (actual as u8).to_ascii_lowercase() != expected.to_ascii_lowercase() {
+            return false;
+        }
+    }
+    entry.get(key.len()) == Some(&(b'=' as u16))
 }
 
 /// A pseudo-terminal hosting a shell process.
@@ -93,7 +177,10 @@ impl Pty {
                 .context("CreatePipe (output) failed")?;
         }
 
-        let size = COORD { X: cols as i16, Y: rows as i16 };
+        let size = COORD {
+            X: cols as i16,
+            Y: rows as i16,
+        };
         let hpc = unsafe {
             CreatePseudoConsole(size, input_read, output_write, 0)
                 .context("CreatePseudoConsole failed")?
@@ -138,13 +225,7 @@ impl Pty {
         let attr_list_ptr = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr() as *mut c_void);
 
         unsafe {
-            InitializeProcThreadAttributeList(
-                attr_list_ptr,
-                1,
-                0,
-                &mut attr_list_size,
-            )
-            .ok();
+            InitializeProcThreadAttributeList(attr_list_ptr, 1, 0, &mut attr_list_size).ok();
 
             // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE takes the HPCON value itself
             // (not a pointer to it); pass the handle value as lpValue.
@@ -173,7 +254,11 @@ impl Pty {
         si.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
         si.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
         si.StartupInfo.wShowWindow = SW_HIDE.0 as u16;
-        si.lpAttributeList = self.attr_list_buf.as_ref().map(|_| attr_list_ptr).unwrap_or(attr_list_ptr);
+        si.lpAttributeList = self
+            .attr_list_buf
+            .as_ref()
+            .map(|_| attr_list_ptr)
+            .unwrap_or(attr_list_ptr);
 
         // Keep the buffer alive for the duration of CreateProcessW.
         self.attr_list_buf = Some(buf);
@@ -189,6 +274,11 @@ impl Pty {
         let _stdio = StdioHider::install();
 
         let user_env = user_environment();
+        // CreateProcessW copies the block, so the Vec only has to outlive the
+        // call; `user_env` stays in scope until after it returns.
+        let env_ptr = user_env
+            .as_ref()
+            .map(|(block, _)| block.as_ptr() as *const c_void);
 
         let result = unsafe {
             windows::Win32::System::Threading::CreateProcessW(
@@ -198,16 +288,15 @@ impl Pty {
                 None,
                 false, // bInheritHandles - ConPTY handles the connection
                 flags,
-                user_env.as_ref().map(|(block, _)| *block as *const c_void),
+                env_ptr,
                 None, // lpCurrentDirectory - inherit parent's
                 &mut si as *mut STARTUPINFOEXW as *mut _,
                 &mut pi,
             )
         };
 
-        if let Some((block, token)) = user_env {
+        if let Some((_block, token)) = user_env {
             unsafe {
-                let _ = DestroyEnvironmentBlock(block);
                 let _ = CloseHandle(token);
             }
         }
@@ -232,13 +321,8 @@ impl Pty {
     pub fn read_output(&self, buf: &mut [u8]) -> Result<u32> {
         let mut read: u32 = 0;
         unsafe {
-            ReadFile(
-                self.output_read,
-                Some(buf),
-                Some(&mut read),
-                None,
-            )
-            .context("ReadFile from PTY output failed")?;
+            ReadFile(self.output_read, Some(buf), Some(&mut read), None)
+                .context("ReadFile from PTY output failed")?;
         }
         Ok(read)
     }
@@ -268,7 +352,10 @@ impl Pty {
         unsafe {
             windows::Win32::System::Console::ResizePseudoConsole(
                 self.hpc,
-                COORD { X: cols as i16, Y: rows as i16 },
+                COORD {
+                    X: cols as i16,
+                    Y: rows as i16,
+                },
             )
             .context("ResizePseudoConsole failed")?;
         }
@@ -360,3 +447,87 @@ impl Drop for Pty {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a UTF-16 environment block from `NAME=value` entries.
+    fn block(entries: &[&str]) -> Vec<u16> {
+        let mut raw = Vec::new();
+        for entry in entries {
+            raw.extend(entry.encode_utf16());
+            raw.push(0);
+        }
+        raw.push(0);
+        raw
+    }
+
+    fn entries(block: &[u16]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        for &unit in block {
+            if unit == 0 {
+                if current.is_empty() {
+                    break;
+                }
+                out.push(std::mem::take(&mut current));
+            } else {
+                current.push(char::from_u32(unit as u32).unwrap_or('\u{fffd}'));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn term_is_added_when_the_registry_environment_lacks_it() {
+        let out = ensure_terminal_env(&block(&["Path=C:\\Windows", "USERNAME=ben"]));
+        let values = entries(&out);
+
+        assert_eq!(values, vec!["Path=C:\\Windows", "USERNAME=ben", TERM_ENTRY]);
+        assert_eq!(
+            &out[out.len() - 2..],
+            &[0, 0],
+            "block must end with double NUL"
+        );
+    }
+
+    #[test]
+    fn an_existing_term_is_replaced_not_duplicated() {
+        let out = ensure_terminal_env(&block(&[
+            "Path=C:\\Windows",
+            "term=dumb",
+            "TERM=vt100",
+            "USERNAME=ben",
+        ]));
+        let values = entries(&out);
+
+        assert_eq!(
+            values,
+            vec!["Path=C:\\Windows", TERM_ENTRY, "USERNAME=ben"],
+            "only one TERM entry should remain"
+        );
+    }
+
+    #[test]
+    fn is_env_key_matches_ascii_names_case_insensitively() {
+        let term = block(&["term=x"]);
+        let entry = &term[..term.len() - 1];
+        assert!(is_env_key(entry, "TERM"));
+        assert!(is_env_key(entry, "term"));
+        assert!(!is_env_key(entry, "TERMINAL"));
+        assert!(!is_env_key(entry, "TERM_PREFIX"));
+    }
+
+    #[test]
+    fn an_empty_block_still_gets_the_terminal_identity() {
+        let out = ensure_terminal_env(&[0]);
+        assert_eq!(entries(&out), vec![TERM_ENTRY]);
+        assert_eq!(&out[out.len() - 2..], &[0, 0]);
+    }
+
+    #[test]
+    fn values_containing_equals_are_preserved() {
+        let out = ensure_terminal_env(&block(&["=C:=C:\\work", "A=b=c"]));
+        assert_eq!(entries(&out), vec!["=C:=C:\\work", "A=b=c", TERM_ENTRY]);
+    }
+}
