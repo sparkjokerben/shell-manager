@@ -13,13 +13,14 @@ use windows::Win32::System::Console::{
     GetConsoleMode, SetConsoleMode,
     GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO,
     GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
-    ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT,
+    ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT, ENABLE_MOUSE_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, CONSOLE_MODE,
     ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
     ENABLE_PROCESSED_OUTPUT, DISABLE_NEWLINE_AUTO_RETURN,
 };
 use windows::core::PCWSTR;
 use shell_daemon::protocol::{self, Request, Op};
+use shell_daemon::session::{for_each_mouse_mode, mouse_bit};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -42,8 +43,8 @@ fn main() -> Result<()> {
                 eprintln!("start failed: {}", resp.error);
                 std::process::exit(1);
             }
-            let (pipe_out, pipe_in) = extract_pipes(&resp.data);
-            attach(&name, &pipe_out, &pipe_in)
+            let (pipe_out, pipe_in, mouse) = extract_pipes(&resp.data);
+            attach(&name, &pipe_out, &pipe_in, mouse)
         }
         "continue" => {
             if args.len() < 3 {
@@ -58,8 +59,8 @@ fn main() -> Result<()> {
                 eprintln!("continue failed: {}", resp.error);
                 std::process::exit(1);
             }
-            let (pipe_out, pipe_in) = extract_pipes(&resp.data);
-            attach(&name, &pipe_out, &pipe_in)
+            let (pipe_out, pipe_in, mouse) = extract_pipes(&resp.data);
+            attach(&name, &pipe_out, &pipe_in, mouse)
         }
         "detach" => {
             if args.len() < 3 {
@@ -117,7 +118,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn extract_pipes(data: &Option<serde_json::Value>) -> (String, String) {
+fn extract_pipes(data: &Option<serde_json::Value>) -> (String, String, u8) {
     let out = data
         .as_ref()
         .and_then(|d| d.get("pipe_out"))
@@ -130,7 +131,12 @@ fn extract_pipes(data: &Option<serde_json::Value>) -> (String, String) {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    (out, inp)
+    let mouse = data
+        .as_ref()
+        .and_then(|d| d.get("mouse"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u8;
+    (out, inp, mouse)
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -222,12 +228,9 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
     anyhow::bail!("timed out connecting to data pipe {}", name)
 }
 
-/// F12, the detach key: terminals send the standard xterm sequence, ssh does
-/// not consume it, and Claude Code does not bind it.
-const F12_SEQ: &[u8] = b"\x1b[24~";
-
-/// Ctrl+] (0x1D), kept for terminals that do send punctuation chords.
-const CTRL_BRACKET_RIGHT: u8 = 0x1d;
+/// Detach triggers. The printable sequence works from any keyboard and is not
+/// consumed by ssh (unlike "~."); F12 and Ctrl+] are kept as extras.
+const DETACH_SEQS: &[&[u8]] = &[b"@@detach", b"\x1b[24~", b"\x1d"];
 
 /// Disable terminal mouse reporting. A TUI that exits without restoring its
 /// mouse mode otherwise leaves the terminal sending SGR mouse reports, which
@@ -278,19 +281,22 @@ impl DetachDetector {
     fn feed(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
         self.pending.extend_from_slice(data);
 
-        if let Some(pos) = self.pending.iter().position(|&b| b == CTRL_BRACKET_RIGHT) {
-            let forward = self.pending[..pos].to_vec();
-            self.pending.clear();
-            return (forward, true);
-        }
-        if let Some(pos) = find_subslice(&self.pending, F12_SEQ) {
+        let hit = DETACH_SEQS
+            .iter()
+            .filter_map(|seq| find_subslice(&self.pending, seq))
+            .min();
+        if let Some(pos) = hit {
             let forward = self.pending[..pos].to_vec();
             self.pending.clear();
             return (forward, true);
         }
 
-        // Hold back a trailing partial F12 sequence so a split key is still seen.
-        let keep = partial_suffix(&self.pending, F12_SEQ);
+        // Hold back a trailing partial sequence so a split key is still seen.
+        let keep = DETACH_SEQS
+            .iter()
+            .map(|seq| partial_suffix(&self.pending, seq))
+            .max()
+            .unwrap_or(0);
         let split = self.pending.len() - keep;
         let forward = self.pending[..split].to_vec();
         self.pending.drain(..split);
@@ -313,7 +319,69 @@ fn partial_suffix(data: &[u8], needle: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
+/// Removes hover-only mouse motion reports (SGR and X10 encodings).
+///
+/// ConPTY asks the terminal for any-event mouse tracking whenever mouse input
+/// is enabled, so simply moving the pointer at a plain shell prompt would type
+/// escape sequences into it. Clicks, wheel and drag events still pass through
+/// for the hosted TUI.
+fn filter_motion(data: &[u8], pending: &mut Vec<u8>) -> Vec<u8> {
+    let mut buf = std::mem::take(pending);
+    buf.extend_from_slice(data);
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+
+    while i < buf.len() {
+        if i + 2 < buf.len() && buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'<' {
+            // SGR: ESC [ < button ; x ; y M|m
+            let rest = &buf[i + 3..];
+            let end = match rest.iter().position(|&c| c == b'M' || c == b'm') {
+                Some(end) => end,
+                None => {
+                    pending.extend_from_slice(&buf[i..]);
+                    return out;
+                }
+            };
+            let button = rest[..end]
+                .split(|&c| c == b';')
+                .next()
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .and_then(|s| s.parse::<u32>().ok());
+            let hover = matches!(button, Some(b) if (b & 0x20) != 0 && (b & 0x03) == 3);
+            if !hover {
+                out.extend_from_slice(&buf[i..i + 3 + end + 1]);
+            }
+            i += 3 + end + 1;
+            continue;
+        }
+        if i + 2 < buf.len() && buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'M' {
+            // X10: ESC [ M button x y
+            if i + 6 > buf.len() {
+                pending.extend_from_slice(&buf[i..]);
+                return out;
+            }
+            let button = buf[i + 3].wrapping_sub(32);
+            let hover = (button & 0x20) != 0 && (button & 0x03) == 3;
+            if !hover {
+                out.extend_from_slice(&buf[i..i + 6]);
+            }
+            i += 6;
+            continue;
+        }
+        // Hold back only a possible mouse-report prefix; a lone ESC is a normal
+        // key (vim) and must not be delayed.
+        if i + 2 == buf.len() && buf[i] == 0x1b && buf[i + 1] == b'[' {
+            pending.extend_from_slice(&buf[i..]);
+            return out;
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+
+    out
+}
+
+fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE)? };
     let mut orig_in_mode: CONSOLE_MODE = CONSOLE_MODE(0);
@@ -322,6 +390,8 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
         GetConsoleMode(stdin, &mut orig_in_mode).is_ok()
             && GetConsoleMode(stdout, &mut orig_out_mode).is_ok()
     };
+    // Mouse modes the hosted app had enabled when this client attached.
+    let initial_mouse_on = mouse & 0b111 != 0;
 
     // The PTY stream is UTF-8. A Windows console interprets WriteFile bytes with
     // the active output code page, so switch it to UTF-8 (65001) for correct text.
@@ -338,11 +408,27 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
 
     // Print before connecting: once connected, the daemon starts streaming PTY
     // output, and mixing console-wide prints with raw byte writes garbles the line.
-    println!("\r\nattached (detach: F12)");
-    // Start from a clean terminal state: a previous TUI may have left mouse
-    // reporting enabled.
+    println!("\r\nattached (detach: type @@detach)");
+    // Start from a clean terminal state, then restore the mouse modes the
+    // hosted app had enabled before this client attached.
     if has_console {
         let _ = write_all(stdout, MOUSE_RESET);
+        if initial_mouse_on {
+            let mut seq = Vec::new();
+            if mouse & 1 != 0 {
+                seq.extend_from_slice(b"\x1b[?1000h");
+            }
+            if mouse & 2 != 0 {
+                seq.extend_from_slice(b"\x1b[?1002h");
+            }
+            if mouse & 4 != 0 {
+                seq.extend_from_slice(b"\x1b[?1003h");
+            }
+            if mouse & 8 != 0 {
+                seq.extend_from_slice(b"\x1b[?1006h");
+            }
+            let _ = write_all(stdout, &seq);
+        }
     }
 
     // Two unidirectional handles: out is read-only, in is write-only.
@@ -352,20 +438,28 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
     let h_in = open_pipe(pipe_in, GENERIC_WRITE.0)?;
 
     // Put the local console into raw mode so input passes through byte-for-byte.
+    let mut raw_in_mode = CONSOLE_MODE(0);
     if has_console {
-        // Raw input plus VT input, so arrows and function keys (including the
-        // F12 detach key) arrive as VT sequences. Do NOT enable
-        // ENABLE_MOUSE_INPUT: in VT input mode conhost then asks the outer
-        // terminal for all mouse events, and stray reports leak into the shell.
+        // Raw input plus VT input, so arrows and function keys arrive as VT
+        // sequences. Mouse input stays enabled because the hosted TUI needs it;
+        // hover-only motion reports are filtered out below so they do not get
+        // typed into a plain shell prompt.
         // ENABLE_EXTENDED_FLAGS is required for QUICK_EDIT_MODE to take effect.
         let raw_in = (orig_in_mode.0
             | ENABLE_EXTENDED_FLAGS.0
-            | ENABLE_VIRTUAL_TERMINAL_INPUT.0)
+            | ENABLE_VIRTUAL_TERMINAL_INPUT.0
+            | ENABLE_MOUSE_INPUT.0)
             & !(ENABLE_LINE_INPUT.0
                 | ENABLE_ECHO_INPUT.0
                 | ENABLE_PROCESSED_INPUT.0
                 | ENABLE_WINDOW_INPUT.0
                 | ENABLE_QUICK_EDIT_MODE.0);
+        raw_in_mode = CONSOLE_MODE(raw_in);
+        let initial_mode = if initial_mouse_on {
+            CONSOLE_MODE(raw_in | ENABLE_MOUSE_INPUT.0)
+        } else {
+            raw_in_mode
+        };
         // Processed output + VT rendering. DISABLE_NEWLINE_AUTO_RETURN makes the
         // console treat LF like a real terminal (no implicit carriage return).
         let raw_out = orig_out_mode.0
@@ -373,13 +467,14 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
             | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0
             | DISABLE_NEWLINE_AUTO_RETURN.0;
         unsafe {
-            if SetConsoleMode(stdin, CONSOLE_MODE(raw_in)).is_err() {
+            if SetConsoleMode(stdin, initial_mode).is_err() {
                 // VT input unsupported on this console: fall back to plain raw mode.
                 let fallback = (orig_in_mode.0 | ENABLE_EXTENDED_FLAGS.0)
                     & !(ENABLE_LINE_INPUT.0
                         | ENABLE_ECHO_INPUT.0
                         | ENABLE_PROCESSED_INPUT.0
                         | ENABLE_WINDOW_INPUT.0
+                        | ENABLE_MOUSE_INPUT.0
                         | ENABLE_QUICK_EDIT_MODE.0);
                 let _ = SetConsoleMode(stdin, CONSOLE_MODE(fallback));
             }
@@ -458,6 +553,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
         let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
         let mut buf = [0u8; 4096];
         let mut detector = DetachDetector::new();
+        let mut motion_pending: Vec<u8> = Vec::new();
         loop {
             let mut read: u32 = 0;
             let r = unsafe {
@@ -471,7 +567,11 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
             match r {
                 Ok(()) if read == 0 => break,
                 Ok(()) => {
-                    let data = &buf[..read as usize];
+                    let filtered = filter_motion(&buf[..read as usize], &mut motion_pending);
+                    let data = &filtered[..];
+                    if data.is_empty() {
+                        continue;
+                    }
                     let (forward, detach) = detector.feed(data);
                     if detach {
                         // Forward whatever preceded the key on this read before
@@ -505,6 +605,10 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
         }
         let mut buf = [0u8; 4096];
         let mut carry: Vec<u8> = Vec::new();
+        // Mouse modes the hosted app has enabled, tracked from its output.
+        let mut mouse_state = mouse;
+        let mut mouse_on = mouse & 0b111 != 0;
+        let mut mouse_carry: Vec<u8> = Vec::new();
         loop {
             let mut read: u32 = 0;
             let r = unsafe {
@@ -519,6 +623,41 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
                 Ok(()) if read == 0 => break,
                 Ok(()) => {
                     let chunk = &buf[..read as usize];
+
+                    // Follow the app's DEC mouse modes: enable mouse input only
+                    // while it actually wants mouse, so conhost does not ask the
+                    // terminal for reports that nobody consumes.
+                    if has_console {
+                        let mut scan = Vec::with_capacity(mouse_carry.len() + chunk.len());
+                        scan.extend_from_slice(&mouse_carry);
+                        scan.extend_from_slice(chunk);
+                        for_each_mouse_mode(&scan, |mode, on| {
+                            if let Some(bit) = mouse_bit(mode) {
+                                if on {
+                                    mouse_state |= bit;
+                                } else {
+                                    mouse_state &= !bit;
+                                }
+                            }
+                        });
+                        let keep = scan.len().min(16);
+                        mouse_carry.clear();
+                        mouse_carry.extend_from_slice(&scan[scan.len() - keep..]);
+
+                        let now = mouse_state & 0b111 != 0;
+                        if now != mouse_on {
+                            mouse_on = now;
+                            let mode = if now {
+                                CONSOLE_MODE(raw_in_mode.0 | ENABLE_MOUSE_INPUT.0)
+                            } else {
+                                raw_in_mode
+                            };
+                            unsafe {
+                                let _ = SetConsoleMode(stdin, mode);
+                            }
+                        }
+                    }
+
                     let data = if has_console {
                         // The console renders WriteFile bytes using its code page
                         // (set to UTF-8 above). Hold back an incomplete trailing
@@ -567,7 +706,34 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::DetachDetector;
+    use super::{filter_motion, DetachDetector};
+
+    #[test]
+    fn magic_sequence_detaches() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"@@detach");
+        assert!(detach);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn magic_sequence_after_text_forwards_prefix() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"abc@@detach");
+        assert!(detach);
+        assert_eq!(&out[..], b"abc");
+    }
+
+    #[test]
+    fn magic_sequence_split_across_reads() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"ab@@det");
+        assert!(!detach);
+        assert_eq!(&out[..], b"ab");
+        let (out, detach) = d.feed(b"ach");
+        assert!(detach);
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn f12_detaches() {
@@ -630,5 +796,39 @@ mod tests {
         let (out, detach) = d.feed(b"cd ~/x\r");
         assert!(!detach);
         assert_eq!(&out[..], b"cd ~/x\r");
+    }
+
+    #[test]
+    fn hover_reports_are_filtered() {
+        let mut p = Vec::new();
+        let out = filter_motion(b"a\x1b[<35;1;28Mb", &mut p);
+        assert_eq!(&out[..], b"ab");
+    }
+
+    #[test]
+    fn clicks_wheel_and_drag_pass() {
+        let mut p = Vec::new();
+        let out = filter_motion(b"\x1b[<0;1;28M\x1b[<64;1;28M\x1b[<32;1;28M", &mut p);
+        assert_eq!(&out[..], b"\x1b[<0;1;28M\x1b[<64;1;28M\x1b[<32;1;28M");
+    }
+
+    #[test]
+    fn split_hover_report_is_dropped() {
+        let mut p = Vec::new();
+        assert!(filter_motion(b"\x1b[<35;1", &mut p).is_empty());
+        assert!(filter_motion(b";28M", &mut p).is_empty());
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn x10_hover_is_filtered() {
+        let mut p = Vec::new();
+        assert!(filter_motion(b"\x1b[M\x43\x21\x3c", &mut p).is_empty());
+    }
+
+    #[test]
+    fn lone_escape_is_forwarded() {
+        let mut p = Vec::new();
+        assert_eq!(&filter_motion(b"\x1b", &mut p)[..], b"\x1b");
     }
 }

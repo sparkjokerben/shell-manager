@@ -192,6 +192,7 @@ fn handle_start(
                 "session_id": session_id,
                 "pipe_out": pipe_out,
                 "pipe_in": pipe_in,
+                "mouse": 0u8,
             });
             Response::ok(Some(data))
         }
@@ -235,11 +236,13 @@ fn handle_continue(
     // loop back to accept the next client, so nothing else is needed here.
     let session_id = session.session_id.clone();
     let (pipe_out, pipe_in) = session.data_pipe_paths();
+    let mouse = session.mouse_state();
 
     let data = serde_json::json!({
         "session_id": session_id,
         "pipe_out": pipe_out,
         "pipe_in": pipe_in,
+        "mouse": mouse,
     });
     Response::ok(Some(data))
 }

@@ -12,7 +12,7 @@ use crate::pty::Pty;
 use anyhow::Result;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -54,6 +54,8 @@ pub struct Session {
     pub detach_requested: Arc<AtomicBool>,
     /// Set when a client connection ends; the next attach forces a repaint.
     pub needs_repaint: Arc<AtomicBool>,
+    /// DEC mouse modes the hosted app has enabled (1000/1002/1003/1006).
+    pub mouse_modes: Arc<AtomicU8>,
     /// Win32 thread ids of the out/in threads (for cancelling blocking I/O).
     pub out_tid: Arc<Mutex<Option<u32>>>,
     pub in_tid: Arc<Mutex<Option<u32>>>,
@@ -74,6 +76,7 @@ impl Session {
             client_connected: Arc::new(AtomicBool::new(false)),
             detach_requested: Arc::new(AtomicBool::new(false)),
             needs_repaint: Arc::new(AtomicBool::new(false)),
+            mouse_modes: Arc::new(AtomicU8::new(0)),
             out_tid: Arc::new(Mutex::new(None)),
             in_tid: Arc::new(Mutex::new(None)),
         })
@@ -110,6 +113,8 @@ impl Session {
         let detach_in = self.detach_requested.clone();
         let repaint_out = self.needs_repaint.clone();
         let repaint_in = self.needs_repaint.clone();
+        let mouse_out = self.mouse_modes.clone();
+        let mouse_drain = self.mouse_modes.clone();
 
         // In thread (client -> PTY).
         let in_tid_slot = in_tid.clone();
@@ -124,14 +129,14 @@ impl Session {
         thread::spawn(move || {
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             *out_tid.lock().unwrap() = Some(tid);
-            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out, repaint_out);
+            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out, repaint_out, mouse_out);
         });
 
         // Drain thread (PTY -> discard while no client is attached).
         let drain_pty = self.pty.clone();
         let drain_stop = self.stop_flag.clone();
         let drain_connected = self.client_connected.clone();
-        thread::spawn(move || run_drain_thread(drain_pty, drain_stop, drain_connected));
+        thread::spawn(move || run_drain_thread(drain_pty, drain_stop, drain_connected, mouse_drain));
 
         Ok(())
     }
@@ -144,6 +149,11 @@ impl Session {
     /// Whether the hosted shell process is still running.
     pub fn is_alive(&self) -> bool {
         self.pty.lock().unwrap().is_running()
+    }
+
+    /// DEC mouse modes the hosted app currently has enabled.
+    pub fn mouse_state(&self) -> u8 {
+        self.mouse_modes.load(Ordering::Relaxed)
     }
 
     /// Stop the session: signal and cancel both directional threads.
@@ -193,6 +203,85 @@ impl Session {
     }
 }
 
+/// Bit for one of the DEC private mouse modes we track.
+pub fn mouse_bit(mode: u32) -> Option<u8> {
+    match mode {
+        1000 => Some(1),
+        1002 => Some(2),
+        1003 => Some(4),
+        1006 => Some(8),
+        _ => None,
+    }
+}
+
+/// Calls `f(mode, enabled)` for every DEC private mouse mode toggled in `data`.
+///
+/// Handles multi-parameter sequences such as ESC [ ? 1003 ; 1006 h.
+pub fn for_each_mouse_mode(data: &[u8], mut f: impl FnMut(u32, bool)) {
+    let mut i = 0;
+    while i + 4 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b'[' && data[i + 2] == b'?' {
+            let mut j = i + 3;
+            let mut modes = [0u32; 8];
+            let mut count = 0;
+            loop {
+                let start = j;
+                let mut mode: u32 = 0;
+                while j < data.len() && data[j].is_ascii_digit() {
+                    mode = mode.saturating_mul(10).saturating_add((data[j] - b'0') as u32);
+                    j += 1;
+                }
+                if j == start {
+                    break;
+                }
+                if count < modes.len() {
+                    modes[count] = mode;
+                    count += 1;
+                }
+                if j < data.len() && data[j] == b';' {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            if count > 0 && j < data.len() && (data[j] == b'h' || data[j] == b'l') {
+                let on = data[j] == b'h';
+                for &mode in &modes[..count] {
+                    f(mode, on);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Applies the mouse mode toggles found in `data` to the session state.
+fn apply_mouse_events(data: &[u8], state: &AtomicU8) {
+    for_each_mouse_mode(data, |mode, on| {
+        if let Some(bit) = mouse_bit(mode) {
+            if on {
+                state.fetch_or(bit, Ordering::Relaxed);
+            } else {
+                state.fetch_and(!bit, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+/// Scans `data` together with the previous read's tail, returning the new tail.
+fn scan_with_carry(data: &[u8], carry: &mut Vec<u8>, state: &AtomicU8) {
+    let mut scan = Vec::with_capacity(carry.len() + data.len());
+    scan.extend_from_slice(carry);
+    scan.extend_from_slice(data);
+    apply_mouse_events(&scan, state);
+
+    let keep = scan.len().min(16);
+    carry.clear();
+    carry.extend_from_slice(&scan[scan.len() - keep..]);
+}
+
 fn create_pipe(path: &str, access: windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES) -> Result<HANDLE> {
     let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(
         std::ffi::OsStr::new(path),
@@ -235,15 +324,21 @@ fn cancel_thread_io(tid: Option<u32>) {
 /// Keep the PTY output flowing while no client is attached, so a detached
 /// TUI does not block on a full output pipe. Discards the bytes: the
 /// console buffer in ConPTY keeps the screen state for the reattach repaint.
-fn run_drain_thread(pty: Arc<Mutex<Pty>>, stop: Arc<AtomicBool>, connected: Arc<AtomicBool>) {
+fn run_drain_thread(
+    pty: Arc<Mutex<Pty>>,
+    stop: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
+    mouse: Arc<AtomicU8>,
+) {
     enum Status {
         Attached,
-        Read,
+        Read(usize),
         Idle,
         Dead,
     }
 
     let mut buf = [0u8; 8192];
+    let mut mouse_carry: Vec<u8> = Vec::new();
     let mut idle_ticks: u32 = 0;
 
     loop {
@@ -263,7 +358,7 @@ fn run_drain_thread(pty: Arc<Mutex<Pty>>, stop: Arc<AtomicBool>, connected: Arc<
                     // blocking read with no data would hold the pty lock and
                     // stall is_alive / resize / stop.
                     Ok(n) if n > 0 => match p.read_output(&mut buf) {
-                        Ok(n) if n > 0 => Status::Read,
+                        Ok(n) if n > 0 => Status::Read(n as usize),
                         _ => Status::Dead,
                     },
                     Ok(_) => Status::Idle,
@@ -273,7 +368,12 @@ fn run_drain_thread(pty: Arc<Mutex<Pty>>, stop: Arc<AtomicBool>, connected: Arc<
         };
 
         match status {
-            Status::Read => idle_ticks = 0,
+            Status::Read(n) => {
+                idle_ticks = 0;
+                // Remember which mouse modes the app has enabled, so a later
+                // attach can restore them.
+                scan_with_carry(&buf[..n], &mut mouse_carry, &mouse);
+            }
             Status::Attached => {
                 idle_ticks = 0;
                 thread::sleep(Duration::from_millis(5));
@@ -363,6 +463,7 @@ fn run_out_thread(
     alive: Arc<AtomicBool>,
     detach: Arc<AtomicBool>,
     needs_repaint: Arc<AtomicBool>,
+    mouse: Arc<AtomicU8>,
 ) {
     enum LoopState {
         Data(usize),
@@ -371,6 +472,7 @@ fn run_out_thread(
     }
 
     let mut buf = [0u8; 8192];
+    let mut mouse_carry: Vec<u8> = Vec::new();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -447,6 +549,10 @@ fn run_out_thread(
 
             match state {
                 LoopState::Data(n) => {
+                    // Track the app's mouse modes for the current and future
+                    // attach cycles.
+                    scan_with_carry(&buf[..n], &mut mouse_carry, &mouse);
+
                     let mut pos: usize = 0;
                     while pos < n {
                         let mut written: u32 = 0;
@@ -567,8 +673,7 @@ mod tests {
     }
 
     /// Detaching while output is flowing must disconnect the client promptly and
-    /// leave the shell alive and reattachable.
-    #[test]
+    /// leave the shell alive and reattachable.    #[test]
     fn detach_under_load_keeps_shell() {
         let session = Session::new("unit-detach", 80, 25, "cmd.exe").unwrap();
         session.start_data_pipe_listener().unwrap();
@@ -732,5 +837,25 @@ mod tests {
         }
         session.stop().unwrap();
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn mouse_modes_are_tracked() {
+        let state = AtomicU8::new(0);
+        apply_mouse_events(b"\x1b[?1003;1006h", &state);
+        assert_eq!(state.load(Ordering::Relaxed), 4 | 8);
+        apply_mouse_events(b"\x1b[?1003l", &state);
+        assert_eq!(state.load(Ordering::Relaxed), 8);
+        apply_mouse_events(b"\x1b[?1000h\x1b[?1002h", &state);
+        assert_eq!(state.load(Ordering::Relaxed), 8 | 1 | 2);
+        apply_mouse_events(b"\x1b[?1000l\x1b[?1002l\x1b[?1006l", &state);
+        assert_eq!(state.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mouse_scan_ignores_other_sequences() {
+        let state = AtomicU8::new(0);
+        apply_mouse_events(b"\x1b[1;2H\x1b[?25ltext\x1b[?1049h", &state);
+        assert_eq!(state.load(Ordering::Relaxed), 0);
     }
 }
