@@ -1,9 +1,16 @@
 .app {
+  position: fixed;
+  top: var(--app-top, 0px);
+  right: 0;
+  left: 0;
   display: flex;
   flex-direction: column;
-  height: 100dvh;
+  height: var(--app-height, 100dvh);
   overflow: hidden;
   background: var(--petrol);
+  /* 建立包含块：抽屉、对话框和 toast 的 position: fixed 会相对这个
+     尺寸等于可视区域的 .app 定位，而不是键盘弹出后未缩小的布局视口。 */
+  transform: translateZ(0);
 }
 
 .masthead {

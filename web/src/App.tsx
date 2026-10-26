@@ -26,6 +26,7 @@ import {
   type NewSessionDraft,
   type ToastState,
 } from "./types";
+import { useViewportHeight } from "./useViewportHeight";
 
 interface TokenPrompt {
   reason: string;
@@ -40,6 +41,8 @@ function tokenErrorMessage(error: unknown): string {
 }
 
 export default function App() {
+  useViewportHeight();
+
   const [token, setToken] = useState<string | null>(() => loadToken());
   const [health, setHealth] = useState<Health | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);

@@ -1,7 +1,7 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   buildWebSocketUrl,
   translateServerError,
@@ -10,6 +10,7 @@ import {
   type WsServerMessage,
 } from "../api";
 import type { ConnectionPhase, ConnectionSnapshot } from "../types";
+import { MobileKeys } from "./MobileKeys";
 
 interface TerminalPaneProps {
   session: Session;
@@ -185,6 +186,34 @@ export function TerminalPane({
     }, 150);
   }, [sendMessage]);
 
+  /**
+   * 终端输入的唯一发送入口：键盘输入、移动端快捷键栏和粘贴都走这里，
+   * 因此都遵守 ready 前的缓冲与连接状态检查。
+   */
+  const sendInput = useCallback((data: string) => {
+    if (!data) {
+      return;
+    }
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (!readyRef.current) {
+      // Hold a few characters typed while the handshake is in flight.
+      const pending = pendingInputRef.current;
+      const length = pending.reduce((total, part) => total + part.length, 0);
+      if (length + data.length <= 4096) {
+        pending.push(data);
+      }
+      return;
+    }
+    socket.send(encoderRef.current.encode(data));
+  }, []);
+
+  const focusTerminal = useCallback(() => {
+    terminalRef.current?.focus();
+  }, []);
+
   const fitTerminal = useCallback(() => {
     const terminal = terminalRef.current;
     const fit = fitRef.current;
@@ -198,16 +227,29 @@ export function TerminalPane({
     }
   }, []);
 
+  /**
+   * 软键盘弹出/收起会改变可视高度，重新 fit 后把视口贴回底部，
+   * 保证光标始终可见。
+   */
+  const fitTerminalAndStick = useCallback(() => {
+    fitTerminal();
+    terminalRef.current?.scrollToBottom();
+  }, [fitTerminal]);
+
   useEffect(() => {
     const host = hostRef.current;
     if (!host) {
       return;
     }
 
+    // 手机上略大的字号更容易点选和阅读；桌面保持原来的 13。
+    const narrowScreen = window.matchMedia("(max-width: 760px)");
+    const fontSize = () => (narrowScreen.matches ? 15 : 13);
+
     const terminal = new Terminal({
       scrollback: 5000,
       fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace',
-      fontSize: 13,
+      fontSize: fontSize(),
       lineHeight: 1.2,
       cursorBlink: true,
       cursorStyle: "bar",
@@ -221,22 +263,7 @@ export function TerminalPane({
     terminalRef.current = terminal;
     fitRef.current = fit;
 
-    const dataDisposable = terminal.onData((data) => {
-      const socket = socketRef.current;
-      if (socket?.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      if (!readyRef.current) {
-        // Hold a few characters typed while the handshake is in flight.
-        const pending = pendingInputRef.current;
-        const length = pending.reduce((total, part) => total + part.length, 0);
-        if (length + data.length <= 4096) {
-          pending.push(data);
-        }
-        return;
-      }
-      socket.send(encoderRef.current.encode(data));
-    });
+    const dataDisposable = terminal.onData(sendInput);
 
     // xterm reports X10 mouse encoding (and other binary input) through
     // onBinary, not onData. Without this subscription those reports vanish.
@@ -256,22 +283,41 @@ export function TerminalPane({
       scheduleResize(cols, rows);
     });
 
-    const resizeObserver = new ResizeObserver(() => {
+    const scheduleFitAndStick = () => {
       if (fitFrameRef.current !== null) {
         window.cancelAnimationFrame(fitFrameRef.current);
       }
       fitFrameRef.current = window.requestAnimationFrame(() => {
         fitFrameRef.current = null;
-        fitTerminal();
+        fitTerminalAndStick();
       });
-    });
+    };
+
+    const resizeObserver = new ResizeObserver(scheduleFitAndStick);
     resizeObserver.observe(host);
 
-    fitTerminal();
+    // visualViewport 的变化不一定会改变布局视口，额外监听一次，
+    // 确保软键盘弹出/收起后终端重新 fit 并滚到底部。
+    const viewport = window.visualViewport;
+    viewport?.addEventListener("resize", scheduleFitAndStick);
+    window.addEventListener("resize", scheduleFitAndStick);
+    window.addEventListener("orientationchange", scheduleFitAndStick);
+
+    const handleNarrowScreen = () => {
+      terminal.options.fontSize = fontSize();
+      scheduleFitAndStick();
+    };
+    narrowScreen.addEventListener("change", handleNarrowScreen);
+
+    scheduleFitAndStick();
     terminal.focus();
 
     return () => {
       resizeObserver.disconnect();
+      viewport?.removeEventListener("resize", scheduleFitAndStick);
+      window.removeEventListener("resize", scheduleFitAndStick);
+      window.removeEventListener("orientationchange", scheduleFitAndStick);
+      narrowScreen.removeEventListener("change", handleNarrowScreen);
       dataDisposable.dispose();
       binaryDisposable.dispose();
       resizeDisposable.dispose();
@@ -285,7 +331,7 @@ export function TerminalPane({
       terminalRef.current = null;
       fitRef.current = null;
     };
-  }, [fitTerminal, scheduleResize]);
+  }, [fitTerminalAndStick, scheduleResize, sendInput]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -503,6 +549,14 @@ export function TerminalPane({
   const canDetach = phase === "connected" || phase === "connecting";
   const showForce = occupied || (phase === "error" && session.attached);
 
+  const handleHostPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    // iOS 上点击终端画布不会自动聚焦隐藏 textarea，软键盘因此不弹出。
+    // 这里只补一次 focus，不 preventDefault，保留 xterm 的滚动与选择行为。
+    if (event.pointerType === "touch") {
+      terminalRef.current?.focus();
+    }
+  };
+
   return (
     <section className="terminal-pane" aria-label={`${session.name} 的终端`}>
       <header className="terminal-head">
@@ -550,7 +604,14 @@ export function TerminalPane({
           </div>
         ) : null}
 
-        <div className="terminal-host" ref={hostRef} aria-label={`${session.name} 的交互式终端`} />
+        <div
+          className="terminal-host"
+          ref={hostRef}
+          aria-label={`${session.name} 的交互式终端`}
+          onPointerDown={handleHostPointerDown}
+        />
+
+        <MobileKeys onSend={sendInput} onFocusTerminal={focusTerminal} />
 
         <footer className="terminal-foot">
           <span>关闭标签页或断开连接会结束此浏览器连接。</span>

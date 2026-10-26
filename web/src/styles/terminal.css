@@ -175,6 +175,12 @@
   height: 100%;
 }
 
+/* iOS 会对 font-size 小于 16px 的输入控件在聚焦时自动放大整页。
+   xterm 的隐藏 textarea 用于接收键盘输入，这里强制 16px 以阻止缩放。 */
+.terminal-host .xterm .xterm-helper-textarea {
+  font-size: 16px !important;
+}
+
 .terminal-host .xterm-viewport {
   background-color: transparent !important;
   scrollbar-color: var(--line) var(--petrol-deep);
@@ -207,6 +213,76 @@
 
 .terminal-foot-strong {
   color: var(--ink-soft);
+}
+
+/* 移动端快捷键栏：默认隐藏，由触摸/窄屏媒体查询打开。 */
+.mobile-keys {
+  display: none;
+}
+
+.mobile-keys-scroll {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  padding: 6px calc(8px + env(safe-area-inset-right, 0px)) calc(6px + env(safe-area-inset-bottom, 0px))
+    calc(8px + env(safe-area-inset-left, 0px));
+  border-top: 1px solid var(--line-soft);
+  background: var(--petrol-soft);
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+.mobile-keys-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.mobile-key {
+  flex: none;
+  min-width: 44px;
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--slate);
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1;
+  white-space: nowrap;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.mobile-key-wide {
+  min-width: 56px;
+}
+
+.mobile-key:active {
+  border-color: var(--ice);
+  background: var(--slate-raised);
+  color: var(--parchment);
+}
+
+.mobile-keys-note {
+  position: absolute;
+  right: 8px;
+  bottom: calc(100% + 8px);
+  left: 8px;
+  z-index: 2;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--brass);
+  border-radius: var(--radius);
+  background: var(--slate-raised);
+  color: var(--parchment);
+  font-size: 11.5px;
+  line-height: 1.4;
+  box-shadow: 0 10px 26px rgba(4, 10, 11, 0.32);
 }
 
 @media (max-width: 760px) {
@@ -247,5 +323,18 @@
 
   .terminal-host {
     padding: 6px 5px 0;
+  }
+}
+
+@media (hover: none), (max-width: 760px) {
+  .mobile-keys {
+    position: relative;
+    display: block;
+    flex: none;
+  }
+
+  /* 手机端屏幕空间有限，脚注信息价值低，隐藏以给终端让位。 */
+  .terminal-foot {
+    display: none;
   }
 }

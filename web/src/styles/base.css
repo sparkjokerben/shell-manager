@@ -10,6 +10,13 @@ body,
   height: 100%;
 }
 
+html,
+body {
+  /* 禁止 iOS 在横竖屏切换或聚焦输入控件时擅自放大字号。 */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 html {
   color-scheme: dark;
   background: var(--petrol);
@@ -397,7 +404,7 @@ button:disabled {
 .dialog {
   position: relative;
   width: min(460px, calc(100vw - 32px));
-  max-height: calc(100dvh - 40px);
+  max-height: calc(var(--app-height, 100dvh) - 40px);
   overflow: auto;
   padding: 22px 24px 20px;
   border: 1px solid var(--line-strong);
@@ -523,6 +530,15 @@ button:disabled {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@media (hover: none), (max-width: 760px) {
+  /* iOS 会对 font-size 小于 16px 的输入控件在聚焦时放大整页，
+     令牌与新建会话表单因此改用 16px；#smw-token 的特异性更高，需一并覆盖。 */
+  .text-input,
+  #smw-token {
+    font-size: 16px;
   }
 }
 
