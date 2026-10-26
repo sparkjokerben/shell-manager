@@ -158,7 +158,8 @@ fn handle_start(name: &str, wsl: Option<bool>, sessions: &SessionTable) -> Respo
     let cmd = if wsl.unwrap_or(false) {
         "wsl.exe".to_string()
     } else {
-        "powershell.exe".to_string()
+        // 默认 PowerShell 7 (pwsh.exe)，不使用 PowerShell 5.1 (powershell.exe)
+        "pwsh.exe".to_string()
     };
 
     match Session::new(name, 120, 40, &cmd) {
