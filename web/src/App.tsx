@@ -34,7 +34,7 @@ interface TokenPrompt {
 
 function tokenErrorMessage(error: unknown): string {
   if (isUnauthorized(error)) {
-    return "The access token is missing or was rejected.";
+    return "访问令牌缺失或已被拒绝。";
   }
   return errorMessage(error);
 }
@@ -98,14 +98,14 @@ export default function App() {
       }
       setHealth(result);
       if (result.has_token && !token) {
-        promptToken("This smw instance requires an access token. Enter it to manage sessions.");
+        promptToken("此 smw 实例需要访问令牌。输入令牌以管理会话。");
       }
     } catch (caught) {
       if (healthSeqRef.current !== seq) {
         return;
       }
       if (isUnauthorized(caught)) {
-        promptToken("This smw instance requires an access token.");
+        promptToken("此 smw 实例需要访问令牌。");
       }
       setHealthError(tokenErrorMessage(caught));
     } finally {
@@ -145,8 +145,8 @@ export default function App() {
         if (isUnauthorized(caught)) {
           promptToken(
             token
-              ? "The saved access token was rejected. Enter it again."
-              : "This smw instance requires an access token.",
+              ? "已保存的访问令牌被拒绝，请重新输入。"
+              : "此 smw 实例需要访问令牌。",
           );
         }
         setSessionsError(tokenErrorMessage(caught));
@@ -246,7 +246,7 @@ export default function App() {
     setSelectedName(name);
     const next: ConnectionSnapshot = {
       phase: "connecting",
-      detail: `Attaching to ${name}...`,
+      detail: `正在附着到 ${name}…`,
     };
     connectionRef.current = next;
     setConnection(next);
@@ -333,7 +333,7 @@ export default function App() {
       await createSession(token, draft);
     } catch (caught) {
       if (isUnauthorized(caught)) {
-        promptToken("Enter a valid token before creating a session.");
+        promptToken("创建会话前请输入有效的令牌。");
       }
       throw caught;
     }
@@ -349,12 +349,12 @@ export default function App() {
     setSelectedName(draft.name);
     const next: ConnectionSnapshot = {
       phase: "connecting",
-      detail: `Attaching to ${draft.name}...`,
+      detail: `正在附着到 ${draft.name}…`,
     };
     connectionRef.current = next;
     setConnection(next);
     setAttachSignal((value) => value + 1);
-    setToast({ message: `Started ${draft.name}.`, tone: "info" });
+    setToast({ message: `已启动 ${draft.name}。`, tone: "info" });
     void fetchSessions("manual");
   };
 
@@ -381,13 +381,13 @@ export default function App() {
         setConnection(IDLE_CONNECTION);
       }
       setToast({
-        message: `Stopped ${target.name}. Its shell and running programs are gone.`,
+        message: `已停止 ${target.name}，其 shell 和正在运行的程序已一并销毁。`,
         tone: "info",
       });
       void fetchSessions("manual");
     } catch (caught) {
       if (isUnauthorized(caught)) {
-        promptToken("Enter a valid token before stopping a session.");
+        promptToken("停止会话前请输入有效的令牌。");
       }
       setActionError(tokenErrorMessage(caught));
     } finally {
@@ -411,13 +411,13 @@ export default function App() {
       await detachSession(token, target.name);
       setForceTarget(null);
       setToast({
-        message: `Disconnected the client attached to ${target.name}. The shell keeps running.`,
+        message: `已断开附着到 ${target.name} 的客户端，shell 仍在运行。`,
         tone: "info",
       });
       void fetchSessions("manual");
     } catch (caught) {
       if (isUnauthorized(caught)) {
-        promptToken("Enter a valid token before disconnecting a client.");
+        promptToken("断开客户端前请输入有效的令牌。");
       }
       setActionError(tokenErrorMessage(caught));
     } finally {
@@ -436,7 +436,7 @@ export default function App() {
     setAuthBlocked(false);
     setSessionsError(null);
     setHealthError(null);
-    setToast({ message: "Token saved for this browser.", tone: "info" });
+    setToast({ message: "令牌已保存在此浏览器中。", tone: "info" });
   };
 
   const clearCredentials = () => {
@@ -452,14 +452,14 @@ export default function App() {
     if (health?.has_token || authBlocked) {
       setAuthBlocked(true);
       setTokenGate({
-        reason: "Credentials cleared. Enter a token to reconnect to this smw instance.",
+        reason: "凭据已清除。请输入令牌以重新连接此 smw 实例。",
         canCancel: true,
       });
     } else {
       setAuthBlocked(false);
       setTokenGate(null);
     }
-    setToast({ message: "Cleared the saved token.", tone: "info" });
+    setToast({ message: "已清除保存的令牌。", tone: "info" });
   };
 
   const tokenRequired = health?.has_token === true;
@@ -473,7 +473,7 @@ export default function App() {
       <TerminalPane
         key={selectedSession.name}
         session={selectedSession}
-        instance={health?.instance ?? "unknown"}
+        instance={health?.instance ?? "未知"}
         token={token}
         attachSignal={attachSignal}
         onConnectionChange={handleConnectionChange}
@@ -483,15 +483,15 @@ export default function App() {
     stage = (
       <EmptyState
         kind="token"
-        title="Access token required."
-        body="This smw instance protects its API with a token. Enter it to list and attach sessions."
+        title="需要访问令牌。"
+        body="此 smw 实例使用令牌保护其 API。输入令牌即可列出并附着会话。"
         detail={sessionsError ?? healthError}
         onNew={() => setNewOpen(true)}
         onShowSessions={showSessions}
         onRetry={refreshNow}
         onEnterToken={() =>
           setTokenGate({
-            reason: "Enter the access token for this smw instance.",
+            reason: "输入此 smw 实例的访问令牌。",
             canCancel: true,
           })
         }
@@ -501,13 +501,13 @@ export default function App() {
     stage = (
       <EmptyState
         kind="loading"
-        title="Opening the console."
-        body="Reading the session list from smw."
+        title="正在打开控制台。"
+        body="正在从 smw 读取会话列表。"
         onNew={() => setNewOpen(true)}
         onShowSessions={showSessions}
         onRetry={refreshNow}
         onEnterToken={() =>
-          setTokenGate({ reason: "Enter the access token for this smw instance.", canCancel: true })
+          setTokenGate({ reason: "输入此 smw 实例的访问令牌。", canCancel: true })
         }
       />
     );
@@ -515,14 +515,14 @@ export default function App() {
     stage = (
       <EmptyState
         kind="error"
-        title="smw is not responding."
-        body="The session list could not be loaded. Check that smd and smw are running, then retry."
+        title="smw 无响应。"
+        body="无法加载会话列表。请确认 smd 和 smw 正在运行，然后重试。"
         detail={sessionsError ?? healthError}
         onNew={() => setNewOpen(true)}
         onShowSessions={showSessions}
         onRetry={refreshNow}
         onEnterToken={() =>
-          setTokenGate({ reason: "Enter the access token for this smw instance.", canCancel: true })
+          setTokenGate({ reason: "输入此 smw 实例的访问令牌。", canCancel: true })
         }
       />
     );
@@ -530,13 +530,13 @@ export default function App() {
     stage = (
       <EmptyState
         kind="empty"
-        title="No sessions yet."
-        body="Start a PowerShell or WSL session. It keeps running after you close this page."
+        title="还没有会话。"
+        body="启动一个 PowerShell 或 WSL 会话。关闭此页面后它仍会继续运行。"
         onNew={() => setNewOpen(true)}
         onShowSessions={showSessions}
         onRetry={refreshNow}
         onEnterToken={() =>
-          setTokenGate({ reason: "Enter the access token for this smw instance.", canCancel: true })
+          setTokenGate({ reason: "输入此 smw 实例的访问令牌。", canCancel: true })
         }
       />
     );
@@ -544,13 +544,13 @@ export default function App() {
     stage = (
       <EmptyState
         kind="idle"
-        title="No session selected."
-        body="Choose a session from the sidebar, or start a new one. Detaching never stops it."
+        title="未选择会话。"
+        body="从侧栏选择一个会话，或新建会话。断开连接不会停止它。"
         onNew={() => setNewOpen(true)}
         onShowSessions={showSessions}
         onRetry={refreshNow}
         onEnterToken={() =>
-          setTokenGate({ reason: "Enter the access token for this smw instance.", canCancel: true })
+          setTokenGate({ reason: "输入此 smw 实例的访问令牌。", canCancel: true })
         }
       />
     );
@@ -565,17 +565,17 @@ export default function App() {
           onClick={() => setDrawerOpen(true)}
           aria-expanded={drawerOpen}
           aria-controls="session-drawer"
-          aria-label="Show sessions"
+          aria-label="显示会话"
         >
           <MenuIcon />
-          <span>Sessions</span>
+          <span>会话</span>
         </button>
 
         <div className="brand">
           <BridgeMark className="brand-mark" />
           <div className="brand-lockup">
             <span className="brand-name">smw</span>
-            <span className="brand-sub">persistent shells for Windows</span>
+            <span className="brand-sub">面向 Windows 的持久 shell</span>
           </div>
         </div>
 
@@ -583,9 +583,9 @@ export default function App() {
           <div className="bridge-readout" data-state={bridgeState} title={healthError ?? undefined}>
             <span className="signal-lamp" aria-hidden="true" />
             <span className="readout">
-              <span className="readout-label">instance</span>
+              <span className="readout-label">实例</span>
               <span className="readout-value">
-                {health?.instance ?? (healthLoading ? "checking" : "unavailable")}
+                {health?.instance ?? (healthLoading ? "检查中" : "不可用")}
               </span>
             </span>
           </div>
@@ -598,7 +598,7 @@ export default function App() {
           <button
             className="drawer-scrim"
             type="button"
-            aria-label="Close sessions"
+            aria-label="关闭会话"
             onClick={closeDrawer}
           />
         ) : null}
@@ -622,7 +622,7 @@ export default function App() {
           onForceDisconnect={requestForce}
           onEnterToken={() =>
             setTokenGate({
-              reason: "Enter the access token for this smw instance.",
+              reason: "输入此 smw 实例的访问令牌。",
               canCancel: true,
             })
           }
@@ -638,9 +638,9 @@ export default function App() {
 
       {stopTarget ? (
         <ConfirmDialog
-          title={`Stop ${stopTarget.name}?`}
-          description="This destroys the shell and every program it is running. Use Detach if you only want to close the browser connection."
-          confirmLabel="Stop and destroy"
+          title={`停止并销毁 ${stopTarget.name}？`}
+          description="这会销毁 shell 及其正在运行的所有程序。若只想关闭浏览器连接，请使用“断开连接”。"
+          confirmLabel="停止并销毁"
           busy={actionBusy}
           error={actionError}
           onCancel={() => {
@@ -655,9 +655,9 @@ export default function App() {
 
       {forceTarget ? (
         <ConfirmDialog
-          title={`Disconnect the client attached to ${forceTarget.name}?`}
-          description="The browser client currently attached will be disconnected. The shell and its programs keep running, and you can attach again."
-          confirmLabel="Force disconnect"
+          title={`断开附着到 ${forceTarget.name} 的客户端？`}
+          description="当前附着的浏览器客户端将被断开。shell 及其程序仍会继续运行，你可以稍后再次附着。"
+          confirmLabel="强制断开"
           tone="caution"
           busy={actionBusy}
           error={actionError}
@@ -692,7 +692,7 @@ export default function App() {
             className="icon-button toast-close"
             type="button"
             onClick={() => setToast(null)}
-            aria-label="Dismiss message"
+            aria-label="关闭消息"
           >
             <CloseIcon />
           </button>

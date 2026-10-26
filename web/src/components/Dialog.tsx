@@ -99,7 +99,7 @@ export function Dialog({
         <div className="dialog-heading">
           <h2 id={titleId}>{title}</h2>
           {onClose ? (
-            <button className="icon-button" type="button" onClick={onClose} aria-label="Close">
+            <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">
               <CloseIcon />
             </button>
           ) : null}

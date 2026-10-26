@@ -4,6 +4,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   buildWebSocketUrl,
+  translateServerError,
   type Session,
   type WsClientMessage,
   type WsServerMessage,
@@ -106,13 +107,13 @@ function looksOccupied(message: string): boolean {
 function phaseLabel(phase: ConnectionPhase): string {
   switch (phase) {
     case "connecting":
-      return "Connecting";
+      return "连接中";
     case "connected":
-      return "Connected";
+      return "已连接";
     case "disconnected":
-      return "Disconnected";
+      return "已断开";
     case "error":
-      return "Error";
+      return "错误";
   }
 }
 
@@ -140,7 +141,7 @@ export function TerminalPane({
   const onConnectionChangeRef = useRef(onConnectionChange);
 
   const [phase, setPhase] = useState<ConnectionPhase>("connecting");
-  const [detail, setDetail] = useState(`Attaching to ${session.name}...`);
+  const [detail, setDetail] = useState(`正在附着到 ${session.name}…`);
   const [occupied, setOccupied] = useState(false);
   const [attempt, setAttempt] = useState<Attempt>({ id: 0, takeover: false });
 
@@ -301,8 +302,8 @@ export function TerminalPane({
     setPhase("connecting");
     setDetail(
       attempt.takeover
-        ? `Taking over ${session.name}; the client attached there will be disconnected.`
-        : `Attaching to ${session.name}...`,
+        ? `正在接管 ${session.name}；该处已附着的客户端将被断开。`
+        : `正在附着到 ${session.name}…`,
     );
 
     fitTerminal();
@@ -324,7 +325,7 @@ export function TerminalPane({
       socket = new WebSocket(url);
     } catch {
       setPhase("error");
-      setDetail("The browser could not open a WebSocket connection to smw.");
+      setDetail("浏览器无法与 smw 建立 WebSocket 连接。");
       return;
     }
 
@@ -338,7 +339,7 @@ export function TerminalPane({
       }
       lastEventRef.current = "error";
       setPhase("error");
-      setDetail("The connection did not become ready within 15 seconds. smw may be unreachable.");
+      setDetail("连接在 15 秒内未就绪，smw 可能无法访问。");
       try {
         socket.close(1000, "ready timeout");
       } catch {
@@ -368,7 +369,7 @@ export function TerminalPane({
           readyRef.current = true;
           lastEventRef.current = null;
           setPhase("connected");
-          setDetail(`Connected to ${message.name} on ${message.instance}.`);
+          setDetail(`已连接到 ${message.instance} 上的 ${message.name}。`);
           setOccupied(false);
           terminal.write(mouseSequences(message.mouse));
           const pending = pendingInputRef.current;
@@ -385,7 +386,7 @@ export function TerminalPane({
           readyRef.current = false;
           lastEventRef.current = "exit";
           setPhase("disconnected");
-          setDetail(message.message || "The shell exited.");
+          setDetail(translateServerError(message.message) || "shell 已退出。");
           return;
         }
 
@@ -393,12 +394,13 @@ export function TerminalPane({
         readyRef.current = false;
         lastEventRef.current = "error";
         const busy = looksOccupied(message.message);
+        const serverDetail = translateServerError(message.message);
         setOccupied(busy);
         setPhase("error");
         setDetail(
           busy
-            ? "This shell is attached to another client. Force takeover disconnects that client; the shell keeps running."
-            : message.message || "The bridge could not attach this session.",
+            ? "此 shell 已附着到另一个客户端。强制接管会断开该客户端；shell 仍会继续运行。"
+            : serverDetail || "无法附着此会话。",
         );
         return;
       }
@@ -412,7 +414,7 @@ export function TerminalPane({
       if (!isCurrent() || lastEventRef.current !== null) {
         return;
       }
-      setDetail("The WebSocket handshake failed. smw may be unreachable, or this session may be in use.");
+      setDetail("WebSocket 握手失败。smw 可能无法访问，或此会话正在被使用。");
     };
 
     socket.onclose = (event) => {
@@ -425,7 +427,7 @@ export function TerminalPane({
       if (manualCloseRef.current) {
         manualCloseRef.current = false;
         setPhase("disconnected");
-        setDetail("Detached. The shell and its programs keep running.");
+        setDetail("已断开连接。shell 及其程序仍在运行。");
         return;
       }
       if (lastEventRef.current === "exit" || lastEventRef.current === "error") {
@@ -434,7 +436,7 @@ export function TerminalPane({
 
       if (event.code === 1000 || event.code === 1005) {
         setPhase("disconnected");
-        setDetail("The bridge closed the connection. The shell keeps running.");
+        setDetail("桥接端已关闭连接。shell 仍在运行。");
         return;
       }
 
@@ -444,12 +446,12 @@ export function TerminalPane({
       if (event.code === 1006) {
         setDetail(
           attachedElsewhere
-            ? "The connection failed. This shell appears to be attached elsewhere; force takeover disconnects that client. The shell keeps running."
-            : "The connection failed. The token may be wrong, smw may be unreachable, or another client may be attached.",
+            ? "连接失败。此 shell 似乎已在别处附着；强制接管会断开该客户端。shell 仍在运行。"
+            : "连接失败。令牌可能有误，smw 可能无法访问，或已有另一个客户端附着。",
         );
       } else {
         const reason = event.reason ? ` ${event.reason}` : "";
-        setDetail(`The connection closed with code ${event.code}.${reason}`);
+        setDetail(`连接已关闭，代码 ${event.code}。${reason}`);
       }
     };
 
@@ -487,13 +489,13 @@ export function TerminalPane({
     const socket = socketRef.current;
     if (!socket) {
       setPhase("disconnected");
-      setDetail("Not attached. The shell keeps running.");
+      setDetail("未附着。shell 仍在运行。");
       return;
     }
     manualCloseRef.current = true;
     sendMessage({ type: "detach" });
     setPhase("disconnected");
-    setDetail("Detached. The shell and its programs keep running.");
+    setDetail("已断开连接。shell 及其程序仍在运行。");
     socket.close(1000, "detach");
   };
 
@@ -502,11 +504,11 @@ export function TerminalPane({
   const showForce = occupied || (phase === "error" && session.attached);
 
   return (
-    <section className="terminal-pane" aria-label={`Terminal for ${session.name}`}>
+    <section className="terminal-pane" aria-label={`${session.name} 的终端`}>
       <header className="terminal-head">
         <div className="terminal-title">
           <h1>{session.name}</h1>
-          <span className="terminal-instance">instance {instance}</span>
+          <span className="terminal-instance">实例 {instance}</span>
         </div>
         <div className="terminal-toolbar">
           <span className="connection-readout" data-phase={phase} aria-live="polite">
@@ -514,16 +516,16 @@ export function TerminalPane({
             {phaseLabel(phase)}
           </span>
           <button className="text-button" type="button" onClick={() => reconnect(true)}>
-            Reconnect
+            重连
           </button>
           <button
             className="text-button"
             type="button"
             onClick={detach}
             disabled={!canDetach}
-            title="Close this browser connection. The shell keeps running."
+            title="关闭此浏览器连接。shell 仍在运行。"
           >
-            Detach
+            断开连接
           </button>
         </div>
       </header>
@@ -537,22 +539,22 @@ export function TerminalPane({
             </div>
             <div className="link-actions">
               <button className="button button-quiet button-small" type="button" onClick={() => reconnect(true)}>
-                {phase === "connecting" ? "Retry" : "Reconnect"}
+                {phase === "connecting" ? "重试" : "重连"}
               </button>
               {showForce ? (
                 <button className="button button-caution button-small" type="button" onClick={() => reconnect(true)}>
-                  Force takeover
+                  强制接管
                 </button>
               ) : null}
             </div>
           </div>
         ) : null}
 
-        <div className="terminal-host" ref={hostRef} aria-label={`Interactive terminal for ${session.name}`} />
+        <div className="terminal-host" ref={hostRef} aria-label={`${session.name} 的交互式终端`} />
 
         <footer className="terminal-foot">
-          <span>Closing the tab or detaching ends this browser connection.</span>
-          <span className="terminal-foot-strong">The shell keeps running.</span>
+          <span>关闭标签页或断开连接会结束此浏览器连接。</span>
+          <span className="terminal-foot-strong">shell 仍会继续运行。</span>
         </footer>
       </div>
     </section>

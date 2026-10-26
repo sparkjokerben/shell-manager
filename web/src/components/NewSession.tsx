@@ -10,22 +10,22 @@ interface NewSessionProps {
 
 function validateName(raw: string): string | null {
   if (raw.length === 0) {
-    return "Enter a name for the session.";
+    return "请输入会话名称。";
   }
   if (raw.trim() !== raw) {
-    return "Remove spaces from the start or end of the name.";
+    return "请去掉名称首尾的空格。";
   }
   if (Array.from(raw).length > 64) {
-    return "Keep the name to 64 characters or fewer.";
+    return "名称不得超过 64 个字符。";
   }
   if (/[\u0000-\u001f\u007f]/.test(raw)) {
-    return "Names cannot contain control characters.";
+    return "名称不能包含控制字符。";
   }
   if (/[\\/]/.test(raw)) {
-    return "Names cannot contain slashes.";
+    return "名称不能包含斜杠。";
   }
   if (raw === "." || raw === "..") {
-    return "Names cannot be . or ..";
+    return "名称不能为 . 或 ..";
   }
   return null;
 }
@@ -57,14 +57,14 @@ export function NewSession({ onClose, onCreate }: NewSessionProps) {
   return (
     <Dialog
       titleId="new-session-title"
-      title="New session"
-      description="PowerShell is the default. WSL runs your default Linux distribution."
+      title="新建会话"
+      description="默认使用 PowerShell。WSL 会运行你的默认 Linux 发行版。"
       onClose={busy ? undefined : onClose}
       className="dialog-new"
     >
       <form onSubmit={(event) => void handleSubmit(event)} noValidate>
         <label className="field-label" htmlFor="new-session-name">
-          Name
+          名称
         </label>
         <input
           id="new-session-name"
@@ -79,12 +79,12 @@ export function NewSession({ onClose, onCreate }: NewSessionProps) {
           spellCheck={false}
           data-autofocus
         />
-        <p className="field-hint">Up to 64 characters. No control characters, slashes, or outer spaces.</p>
+        <p className="field-hint">最多 64 个字符。不能包含控制字符、斜杠或首尾空格。</p>
 
         <label className="switch-row" htmlFor="new-session-wsl">
           <span className="switch-copy">
-            <span className="switch-title">Run in WSL</span>
-            <span className="switch-note">Start your default Linux distribution instead of PowerShell.</span>
+            <span className="switch-title">在 WSL 中运行</span>
+            <span className="switch-note">启动你的默认 Linux 发行版，而不是 PowerShell。</span>
           </span>
           <input
             id="new-session-wsl"
@@ -106,10 +106,10 @@ export function NewSession({ onClose, onCreate }: NewSessionProps) {
 
         <div className="dialog-actions">
           <button className="button button-quiet" type="button" onClick={onClose} disabled={busy}>
-            Cancel
+            取消
           </button>
           <button className="button button-primary" type="submit" disabled={busy}>
-            {busy ? "Starting session..." : "Start session"}
+            {busy ? "正在启动会话…" : "启动会话"}
           </button>
         </div>
       </form>

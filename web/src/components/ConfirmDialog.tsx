@@ -36,7 +36,7 @@ export function ConfirmDialog({
       ) : null}
       <div className="dialog-actions">
         <button className="button button-quiet" type="button" onClick={onCancel} disabled={busy} data-autofocus>
-          Cancel
+          取消
         </button>
         <button
           className={`button ${tone === "danger" ? "button-danger" : "button-caution"}`}
@@ -44,7 +44,7 @@ export function ConfirmDialog({
           onClick={onConfirm}
           disabled={busy}
         >
-          {busy ? "Working..." : confirmLabel}
+          {busy ? "处理中…" : confirmLabel}
         </button>
       </div>
     </Dialog>

@@ -16,11 +16,11 @@ export function TokenGate({ reason, canCancel, onCancel, onSubmit }: TokenGatePr
     event.preventDefault();
     const trimmed = token.trim();
     if (!trimmed) {
-      setError("Enter the token shown for this smw instance.");
+      setError("请输入此 smw 实例显示的令牌。");
       return;
     }
     if (/[\u0000-\u001f\u007f]/.test(trimmed)) {
-      setError("The token contains invalid control characters.");
+      setError("令牌包含无效的控制字符。");
       return;
     }
     onSubmit(trimmed);
@@ -29,14 +29,14 @@ export function TokenGate({ reason, canCancel, onCancel, onSubmit }: TokenGatePr
   return (
     <Dialog
       titleId="token-gate-title"
-      title="Access token"
+      title="访问令牌"
       description={reason}
       onClose={canCancel ? onCancel : undefined}
       className="dialog-token"
     >
       <form onSubmit={handleSubmit} noValidate>
         <label className="field-label" htmlFor="smw-token">
-          Token
+          令牌
         </label>
         <input
           id="smw-token"
@@ -52,8 +52,7 @@ export function TokenGate({ reason, canCancel, onCancel, onSubmit }: TokenGatePr
           data-autofocus
         />
         <p className="field-hint">
-          Kept in this browser only. API requests use an Authorization header; the terminal
-          connection passes it as a query parameter, so avoid logging that URL.
+          仅保存在此浏览器中。API 请求通过 Authorization 头传递令牌；终端连接则将其作为查询参数传递，因此请勿记录该 URL。
         </p>
         {error ? (
           <p className="form-error" role="alert">
@@ -63,11 +62,11 @@ export function TokenGate({ reason, canCancel, onCancel, onSubmit }: TokenGatePr
         <div className="dialog-actions">
           {canCancel ? (
             <button className="button button-quiet" type="button" onClick={onCancel}>
-              Cancel
+              取消
             </button>
           ) : null}
           <button className="button button-primary" type="submit">
-            Save token
+            保存令牌
           </button>
         </div>
       </form>

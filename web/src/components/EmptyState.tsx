@@ -28,26 +28,26 @@ export function EmptyState({
         {detail ? <p className="stage-detail">{detail}</p> : null}
 
         {kind === "loading" ? (
-          <p className="stage-wait">Reading the session list...</p>
+          <p className="stage-wait">正在读取会话列表…</p>
         ) : (
           <div className="stage-actions">
             {kind === "error" ? (
               <button className="button button-primary" type="button" onClick={onRetry}>
-                Retry connection
+                重试连接
               </button>
             ) : kind === "token" ? (
               <button className="button button-primary" type="button" onClick={onEnterToken}>
-                Enter token
+                输入令牌
               </button>
             ) : (
               <button className="button button-primary" type="button" onClick={onNew}>
-                New session
+                新建会话
               </button>
             )}
 
             {kind === "idle" ? (
               <button className="button button-quiet" type="button" onClick={onShowSessions}>
-                Show sessions
+                显示会话
               </button>
             ) : null}
           </div>
@@ -55,12 +55,12 @@ export function EmptyState({
 
         <div className="stage-behavior">
           <div className="behavior-row">
-            <span className="behavior-key">Detach</span>
-            <span>Closes this browser connection, even when you close the tab. The shell keeps running.</span>
+            <span className="behavior-key">断开连接</span>
+            <span>关闭此浏览器连接，包括关闭标签页时。shell 仍会继续运行。</span>
           </div>
           <div className="behavior-row">
-            <span className="behavior-key is-danger">Stop</span>
-            <span>Destroys the shell and every program running inside it.</span>
+            <span className="behavior-key is-danger">停止并销毁</span>
+            <span>销毁 shell 及其内部运行的所有程序。</span>
           </div>
         </div>
       </div>

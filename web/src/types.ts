@@ -7,7 +7,7 @@ export interface ConnectionSnapshot {
 
 export const IDLE_CONNECTION: ConnectionSnapshot = {
   phase: "disconnected",
-  detail: "Not attached.",
+  detail: "未附着。",
 };
 
 export type ToastTone = "info" | "error";

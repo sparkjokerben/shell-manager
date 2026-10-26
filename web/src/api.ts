@@ -81,25 +81,54 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function statusMessage(status: number): string {
   switch (status) {
     case 400:
-      return "smw rejected the request. Check the session name and try again.";
+      return "smw 拒绝了该请求。请检查会话名称后重试。";
     case 401:
-      return "The access token is missing or was rejected.";
+      return "访问令牌缺失或已被拒绝。";
     case 403:
-      return "This token is not allowed to perform that action.";
+      return "此令牌无权执行该操作。";
     case 404:
-      return "That session no longer exists.";
+      return "该会话已不存在。";
     case 409:
-      return "The session is already attached to another client.";
+      return "该会话已附着到另一个客户端。";
     case 429:
-      return "Too many requests. Wait a moment, then retry.";
+      return "请求过于频繁，请稍候重试。";
     case 500:
     case 502:
     case 503:
     case 504:
-      return "smw had a problem completing the request. Try again.";
+      return "smw 在处理请求时出现问题，请重试。";
     default:
-      return `smw returned HTTP ${status}.`;
+      return `smw 返回了 HTTP ${status}。`;
   }
+}
+
+const SERVER_ERROR_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  [
+    /failed to connect to control pipe|is smd running/i,
+    "无法连接 smd，请确认守护进程正在运行",
+  ],
+  [/output backlog exceeded/i, "输出积压过多，已断开；shell 仍在运行"],
+  [/input backlog exceeded/i, "输入积压过多，已断开；shell 仍在运行"],
+  [/output read failed|session input failed/i, "读取/写入终端失败"],
+  [/has exited/i, "会话已退出"],
+  [/already exists/i, "同名会话已存在"],
+  [/session ended/i, "会话已结束"],
+  [/access denied/i, "访问被拒绝"],
+  [/timed out|timeout/i, "操作超时"],
+  [/not found/i, "会话不存在"],
+];
+
+/**
+ * Translate a message produced by smd/smw before it reaches the UI.
+ * Messages already in Chinese and unknown English messages pass through unchanged.
+ */
+export function translateServerError(message: string): string {
+  for (const [pattern, translation] of SERVER_ERROR_PATTERNS) {
+    if (pattern.test(message)) {
+      return translation;
+    }
+  }
+  return message;
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -124,7 +153,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       throw error;
     }
     throw new ApiError(
-      "Cannot reach smw. Check that the daemon is running and the page address is correct.",
+      "无法访问 smw。请确认守护进程正在运行，且页面地址正确。",
       0,
     );
   }
@@ -134,7 +163,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     text = await response.text();
   } catch {
     if (response.ok) {
-      throw new ApiError("smw closed the connection before sending a response.", response.status);
+      throw new ApiError("smw 在发送响应前关闭了连接。", response.status);
     }
   }
 
@@ -144,7 +173,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       payload = JSON.parse(text) as unknown;
     } catch {
       if (response.ok) {
-        throw new ApiError("smw returned a response the browser could not read.", response.status);
+        throw new ApiError("smw 返回了浏览器无法读取的响应。", response.status);
       }
     }
   }
@@ -152,7 +181,10 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   if (!response.ok) {
     const serverMessage =
       isRecord(payload) && typeof payload.error === "string" ? payload.error : null;
-    throw new ApiError(serverMessage || statusMessage(response.status), response.status);
+    throw new ApiError(
+      serverMessage ? translateServerError(serverMessage) : statusMessage(response.status),
+      response.status,
+    );
   }
 
   return payload as T;
@@ -237,5 +269,5 @@ export function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) {
     return error.message;
   }
-  return "Something went wrong. Try again.";
+  return "出了点问题，请重试。";
 }
