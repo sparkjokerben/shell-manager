@@ -349,6 +349,7 @@ pub struct Attachment {
     reader_tid: Arc<AtomicU32>,
     reader_done: Arc<AtomicBool>,
     writer_tid: Arc<AtomicU32>,
+    writer_done: Arc<AtomicBool>,
     registry: AttachRegistry,
 }
 
@@ -387,6 +388,7 @@ impl Attachment {
             reader_tid: self.reader_tid.clone(),
             reader_done: self.reader_done.clone(),
             writer_tid: self.writer_tid.clone(),
+            writer_done: self.writer_done.clone(),
         }
     }
 }
@@ -419,6 +421,7 @@ struct BlockingParts {
     reader_tid: Arc<AtomicU32>,
     reader_done: Arc<AtomicBool>,
     writer_tid: Arc<AtomicU32>,
+    writer_done: Arc<AtomicBool>,
 }
 
 impl BlockingParts {
@@ -451,20 +454,39 @@ impl BlockingParts {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        // A write may be stuck on a daemon that stopped reading; cancel it too.
-        cancel_thread_io(self.writer_tid.load(Ordering::Relaxed));
+        // A write may be stuck on a daemon that stopped reading; cancel it and
+        // close our end as a fallback so WriteFile fails out.
+        let writer_deadline = Instant::now() + READER_STOP_LIMIT;
+        while !self.writer_done.load(Ordering::Acquire) && Instant::now() < writer_deadline {
+            cancel_thread_io(self.writer_tid.load(Ordering::Relaxed));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !self.writer_done.load(Ordering::Acquire) {
+            self.in_handle.close();
+        }
 
-        // Last resort if the cancel loop timed out: closing our end makes the
-        // blocked read fail so the join below cannot hang.
+        // Last resort for the reader: closing our end makes the blocked read
+        // fail so the join below cannot hang.
         if !self.reader_done.load(Ordering::Acquire) {
             self.out_handle.close();
         }
 
-        if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
+        // Only join threads that actually reported completion. Dropping a
+        // JoinHandle detaches it, which beats blocking the async handler
+        // forever when a cancellation never lands.
+        if self.reader_done.load(Ordering::Acquire) {
+            if let Some(handle) = self.reader.take() {
+                let _ = handle.join();
+            }
+        } else {
+            drop(self.reader.take());
         }
-        if let Some(handle) = self.writer.take() {
-            let _ = handle.join();
+        if self.writer_done.load(Ordering::Acquire) {
+            if let Some(handle) = self.writer.take() {
+                let _ = handle.join();
+            }
+        } else {
+            drop(self.writer.take());
         }
 
         // No-ops when the threads already closed their own end.
@@ -535,6 +557,7 @@ pub async fn attach(
     let reader_tid = Arc::new(AtomicU32::new(0));
     let reader_done = Arc::new(AtomicBool::new(false));
     let writer_tid = Arc::new(AtomicU32::new(0));
+    let writer_done = Arc::new(AtomicBool::new(false));
 
     let reader = spawn_reader(
         out_handle.clone(),
@@ -542,7 +565,13 @@ pub async fn attach(
         reader_tid.clone(),
         reader_done.clone(),
     );
-    let writer = spawn_writer(in_handle.clone(), in_rx, out_tx, writer_tid.clone());
+    let writer = spawn_writer(
+        in_handle.clone(),
+        in_rx,
+        out_tx,
+        writer_tid.clone(),
+        writer_done.clone(),
+    );
 
     Ok(Attachment {
         name: name.to_string(),
@@ -556,6 +585,7 @@ pub async fn attach(
         reader_tid,
         reader_done,
         writer_tid,
+        writer_done,
         registry: registry.clone(),
     })
 }
@@ -628,6 +658,7 @@ fn spawn_writer(
     mut input: Receiver<Vec<u8>>,
     events: Sender<OutputEvent>,
     tid: Arc<AtomicU32>,
+    done: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let current = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
@@ -646,6 +677,7 @@ fn spawn_writer(
         }
 
         handle.close();
+        done.store(true, Ordering::Release);
     })
 }
 
