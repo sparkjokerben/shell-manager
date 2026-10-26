@@ -70,6 +70,15 @@ pub struct Session {
     /// quick reattach is not hit by cancellations meant for the old client.
     pub out_gen: Arc<AtomicU32>,
     pub in_gen: Arc<AtomicU32>,
+    /// Serialises publishing a new connection's generation against the detach
+    /// helper's "re-check generations + cancel". A listener waits here between
+    /// `ConnectNamedPipe` and its first I/O, so while it waits it has nothing
+    /// for `CancelSynchronousIo` to abort; the helper therefore cannot cancel a
+    /// client that attached after its last generation check.
+    pub conn_gate: Arc<Mutex<()>>,
+    /// Set once both directional listener threads have been spawned. `stop`
+    /// uses it to avoid waiting for threads that never started.
+    pub listeners_started: AtomicBool,
 }
 
 impl Session {
@@ -94,6 +103,8 @@ impl Session {
             in_done: Arc::new(AtomicBool::new(false)),
             out_gen: Arc::new(AtomicU32::new(0)),
             in_gen: Arc::new(AtomicU32::new(0)),
+            conn_gate: Arc::new(Mutex::new(())),
+            listeners_started: AtomicBool::new(false),
         })
     }
 
@@ -162,6 +173,8 @@ impl Session {
         let in_gen = self.in_gen.clone();
         let out_done = self.out_done.clone();
         let in_done = self.in_done.clone();
+        let gate_in = self.conn_gate.clone();
+        let gate_out = self.conn_gate.clone();
 
         // In thread (client -> PTY).
         let in_tid_slot = in_tid.clone();
@@ -173,7 +186,7 @@ impl Session {
             *in_tid_slot.lock().unwrap() = Some(tid);
             run_in_thread(
                 in_h, input_write, state_in, stop_in_thread, alive_in, detach_in, repaint_in,
-                in_gen_thread,
+                in_gen_thread, gate_in,
             );
         });
 
@@ -183,8 +196,11 @@ impl Session {
             let _done = DoneOnDrop(out_done);
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             *out_tid.lock().unwrap() = Some(tid);
-            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out, repaint_out, mouse_out, out_gen_thread);
+            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out, repaint_out, mouse_out, out_gen_thread, gate_out);
         });
+
+        // Both directional threads exist now; `stop` may wait for them.
+        self.listeners_started.store(true, Ordering::Release);
 
         // Drain thread (PTY -> discard while no client is attached).
         let drain_pty = self.pty.clone();
@@ -214,6 +230,14 @@ impl Session {
     pub fn stop(&self) -> Result<()> {
         *self.state.lock().unwrap() = SessionState::Stopped;
         self.stop_flag.store(true, Ordering::Relaxed);
+
+        // No directional thread exists if the listener was never started (the
+        // session was dropped right after `new`, or `start_data_pipe_listener`
+        // failed). Waiting for them would stall the caller for the full deadline;
+        // daemon callers may hold the session table lock meanwhile.
+        if !self.listeners_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
 
         // One cancel can land in the window between the thread's stop check and
         // its blocking ConnectNamedPipe, leaving it blocked forever (and the
@@ -262,6 +286,7 @@ impl Session {
         let requested = self.detach_requested.clone();
         let in_gen = self.in_gen.clone();
         let out_gen = self.out_gen.clone();
+        let gate = self.conn_gate.clone();
         // Snapshot the connection generations at request time. If either moves,
         // a new client has attached and its I/O must not be cancelled.
         let start_in_gen = in_gen.load(Ordering::SeqCst);
@@ -282,8 +307,13 @@ impl Session {
                 }
                 let it = *in_tid.lock().unwrap();
                 let ot = *out_tid.lock().unwrap();
-                // Re-check after copying the ids but before the blocking cancel:
-                // a new client may have attached and cleared the request.
+                // Hold the connection gate across the re-check and the blocking
+                // cancels. A new client publishes its generation under this same
+                // lock, so it cannot slip in between the check and the cancel;
+                // while it waits it is not doing I/O, hence the cancel can only
+                // hit the previous client. The next iteration sees the bumped
+                // generation and stops before touching the new client.
+                let gate_guard = gate.lock().unwrap();
                 if !requested.load(Ordering::Relaxed)
                     || in_gen.load(Ordering::SeqCst) != start_in_gen
                     || out_gen.load(Ordering::SeqCst) != start_out_gen
@@ -292,6 +322,7 @@ impl Session {
                 }
                 cancel_thread_io(it);
                 cancel_thread_io(ot);
+                drop(gate_guard);
                 thread::sleep(Duration::from_millis(20));
             }
         });
@@ -529,6 +560,7 @@ fn run_in_thread(
     detach: Arc<AtomicBool>,
     needs_repaint: Arc<AtomicBool>,
     generation: Arc<AtomicU32>,
+    gate: Arc<Mutex<()>>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -552,13 +584,20 @@ fn run_in_thread(
             continue;
         }
 
-        // A new client owns this direction now. A pending detach helper watches
-        // this counter and stops instead of cancelling the new client's I/O.
-        generation.fetch_add(1, Ordering::SeqCst);
+        // Publish the new connection under the gate, so a detach helper that is
+        // between its generation check and its cancel cannot hit this client:
+        // it either sees this generation in the re-check, or it holds the gate
+        // while this thread waits here (with no I/O in flight).
+        {
+            let _gate = gate.lock().unwrap();
+            generation.fetch_add(1, Ordering::SeqCst);
+            // A new client owns this direction now; stop cancelling for the old
+            // one.
+            detach.store(false, Ordering::Relaxed);
+        }
 
         set_attached(&state);
         alive.store(true, Ordering::Relaxed);
-        detach.store(false, Ordering::Relaxed);
 
         // Read client input until the client disconnects or a detach is asked for.
         loop {
@@ -612,6 +651,7 @@ fn run_out_thread(
     needs_repaint: Arc<AtomicBool>,
     mouse: Arc<AtomicU8>,
     generation: Arc<AtomicU32>,
+    gate: Arc<Mutex<()>>,
 ) {
     enum LoopState {
         Data(usize),
@@ -642,16 +682,23 @@ fn run_out_thread(
             continue;
         }
 
-        // A new client owns this direction now. A pending detach helper watches
-        // this counter and stops instead of cancelling the new client's I/O.
-        generation.fetch_add(1, Ordering::SeqCst);
+        // Publish the new connection under the gate, so a detach helper that is
+        // between its generation check and its cancel cannot hit this client:
+        // it either sees this generation in the re-check, or it holds the gate
+        // while this thread waits here (with no I/O in flight).
+        {
+            let _gate = gate.lock().unwrap();
+            generation.fetch_add(1, Ordering::SeqCst);
+            // A new client owns this direction now; stop cancelling for the old
+            // one.
+            detach.store(false, Ordering::Relaxed);
+        }
 
         // Claim the output stream under the pty lock so the drain thread cannot
         // read (and discard) bytes after this client has taken over.
         {
             let _p = pty.lock().unwrap();
             alive.store(true, Ordering::Relaxed);
-            detach.store(false, Ordering::Relaxed);
         }
 
         set_attached(&state);
@@ -828,6 +875,21 @@ mod tests {
                 .map_err(|e| e.code().0 as u32)?;
         }
         Ok(read as usize)
+    }
+
+    /// `stop` must not wait for listener threads that were never spawned: the
+    /// daemon drops a session on the start-failure path while holding the
+    /// session table lock.
+    #[test]
+    fn stop_without_listener_returns_immediately() {
+        let session = Session::new("unit-nostart", 80, 25, "cmd.exe").unwrap();
+        let started = Instant::now();
+        session.stop().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "stop waited {:?} with no listener thread",
+            started.elapsed()
+        );
     }
 
     /// Detaching while output is flowing must disconnect the client promptly and
