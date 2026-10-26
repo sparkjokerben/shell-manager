@@ -138,7 +138,7 @@ fn main() -> Result<()> {
                 eprintln!("start failed: {}", resp.error);
                 std::process::exit(1);
             }
-            attach_session(&name, &resp)
+            attach_session(&name, &resp, false)
         }
         Cmd::Detach { name } => {
             let name = resolve(name)?;
@@ -207,7 +207,7 @@ fn attach_or_create(name: &str, wsl: bool) -> Result<()> {
     let (cols, rows) = current_size();
     let resp = request_sized(Op::Continue, name, None, cols, rows)?;
     if resp.ok {
-        return attach_session(name, &resp);
+        return attach_session(name, &resp, true);
     }
 
     // A session that is gone (never existed, or its shell exited) is created on
@@ -226,7 +226,7 @@ fn attach_or_create(name: &str, wsl: bool) -> Result<()> {
         if started.error.contains("already exists") {
             let retried = request_sized(Op::Continue, name, None, cols, rows)?;
             if retried.ok {
-                return attach_session(name, &retried);
+                return attach_session(name, &retried, true);
             }
             eprintln!("attach failed: {}", retried.error);
             std::process::exit(1);
@@ -234,12 +234,16 @@ fn attach_or_create(name: &str, wsl: bool) -> Result<()> {
         eprintln!("start failed: {}", started.error);
         std::process::exit(1);
     }
-    attach_session(name, &started)
+    attach_session(name, &started, false)
 }
 
-fn attach_session(name: &str, resp: &protocol::Response) -> Result<()> {
+/// `repaint` is true when reattaching to an existing session: its screen was
+/// being drained while detached, so the app must redraw. A fresh session has
+/// just been created and needs no size toggle (which can disturb a TUI that is
+/// starting up).
+fn attach_session(name: &str, resp: &protocol::Response, repaint: bool) -> Result<()> {
     let (pipe_out, pipe_in, mouse) = extract_pipes(&resp.data);
-    if let Err(e) = attach(name, &pipe_out, &pipe_in, mouse) {
+    if let Err(e) = attach(name, &pipe_out, &pipe_in, mouse, repaint) {
         eprintln!(
             "attach failed: {:#}\nhint: if another window is attached to '{}', run `sm detach {}` there",
             e, name, name
@@ -397,7 +401,7 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 
 /// Bumped whenever the client's input handling changes, so a stale attach is
 /// easy to spot in the banner.
-const CLIENT_BUILD: &str = "client 2026-10-26h";
+const CLIENT_BUILD: &str = "client 2026-10-27a";
 
 /// Appends a diagnostic line to %TEMP%\sm-client[-<instance>].log.
 ///
@@ -457,6 +461,13 @@ const DETACH_SEQS: &[&[u8]] = &[b"\x1b[24~", b"\x1d"];
 /// mouse mode otherwise leaves the terminal sending SGR mouse reports, which
 /// leak into the shell as typed garbage.
 const MOUSE_RESET: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
+
+/// Leave the alternate screen buffer (all historical variants), so teardown
+/// messages land on the normal screen instead of inside the hosted TUI.
+const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l\x1b[?1047l\x1b[?47l";
+
+/// Show the cursor and reset SGR attributes, restoring a usable local prompt.
+const SHOW_CURSOR_RESET_SGR: &[u8] = b"\x1b[?25h\x1b[0m";
 
 /// DECRST 9001: turn "Win32 input mode" off (Windows Terminal extension).
 ///
@@ -729,7 +740,7 @@ fn filter_motion(data: &[u8], pending: &mut Vec<u8>) -> Vec<u8> {
     out
 }
 
-fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
+fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -> Result<()> {
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE)? };
     let mut orig_in_mode: CONSOLE_MODE = CONSOLE_MODE(0);
@@ -740,15 +751,22 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     };
     // Mouse modes the hosted app had enabled when this client attached.
     let initial_mouse_on = mouse & 0b111 != 0;
+    let (cols, rows) = current_size();
+    let size = match (cols, rows) {
+        (Some(c), Some(r)) => format!("{}x{}", c, r),
+        _ => "unknown".to_string(),
+    };
 
     client_log(&format!(
-        "attach build={} pid={} has_console={} in_mode={:#x} out_mode={:#x} mouse={} stdin={} stdout={}",
+        "attach build={} pid={} has_console={} size={} in_mode={:#x} out_mode={:#x} mouse={} repaint={} stdin={} stdout={}",
         CLIENT_BUILD,
         std::process::id(),
         has_console,
+        size,
         orig_in_mode.0,
         orig_out_mode.0,
         mouse,
+        repaint,
         stdin.0,
         stdout.0,
     ));
@@ -777,9 +795,11 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     let h_out = open_pipe(pipe_out, GENERIC_READ.0)?;
     let h_in = open_pipe(pipe_in, GENERIC_WRITE.0)?;
 
-    // Nothing else tells the hosted app that the screen should be redrawn, so
-    // make it repaint once the daemon has accepted this client.
-    {
+    // A reattach needs a forced full-screen redraw: while detached the app kept
+    // running against a drained output pipe. A freshly created session must not
+    // be resized here - the toggle can race a TUI that is starting up and leave
+    // its bottom rows overwritten.
+    if repaint {
         let repaint_name = name.to_string();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(120));
@@ -910,6 +930,13 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                 if cur == last || cur.0.is_none() || cur.1.is_none() {
                     continue;
                 }
+                client_log(&format!(
+                    "resize {}x{} -> {}x{}",
+                    last.0.unwrap_or(0),
+                    last.1.unwrap_or(0),
+                    cur.0.unwrap_or(0),
+                    cur.1.unwrap_or(0)
+                ));
                 last = cur;
                 let req = Request {
                     op: Op::Resize,
@@ -1128,6 +1155,12 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     // sequence would be printed as literal text.
     if has_console && vt_out_ok {
         let _ = write_all(stdout, MOUSE_RESET);
+        // The hosted TUI may have switched the local terminal to the alternate
+        // screen. Leave it before printing anything: otherwise the detach notice
+        // (and the parent shell prompt) is painted into the frozen TUI screen.
+        // These resets are harmless when no alternate screen was active.
+        let _ = write_all(stdout, LEAVE_ALT_SCREEN);
+        let _ = write_all(stdout, SHOW_CURSOR_RESET_SGR);
     }
     // Plain write instead of println!: a console write racing with teardown must
     // not panic the client with "failed printing to stdout".
