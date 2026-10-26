@@ -18,7 +18,7 @@ Set-Location $PSScriptRoot
 # deployed smw serves the real frontend instead of the "not built" placeholder.
 $web = Join-Path $PSScriptRoot "web"
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-    throw "npm was not found on PATH; install Node.js (22 LTS or newer) to build the web UI for smw.exe"
+    throw "npm was not found on PATH; install Node.js (22.12 or newer) to build the web UI for smw.exe"
 }
 $lockFile = Join-Path $web "package-lock.json"
 $installedLock = Join-Path $web "node_modules\.package-lock.json"
@@ -38,7 +38,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "npm run build failed in $web; smw.exe would only serve a placeholder page"
 }
 
-cargo build --release
+cargo build --release --locked
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
 $bin = Join-Path $env:USERPROFILE "bin"
@@ -46,17 +46,19 @@ New-Item -ItemType Directory -Force -Path $bin | Out-Null
 
 # Client first: replacing sm.exe never disturbs a running session. A running
 # client keeps its image locked, but renaming the image out of the way works.
+$stamp = Get-Date -Format "yyyyMMddHHmmss"
 $sm = Join-Path $bin "sm.exe"
-if (Test-Path $sm) { Move-Item -Force $sm (Join-Path $bin "sm.old.exe") }
+if (Test-Path $sm) { Move-Item -Force $sm (Join-Path $bin "sm.old.$stamp.exe") }
 Copy-Item "target\release\sm.exe" $sm -Force
 Write-Host "Client deployed to $bin"
 
 # Browser bridge. It is a service started on demand, so no logon task is
 # registered for it; replace a running image the same way as sm.exe.
 $smw = Join-Path $bin "smw.exe"
-if (Test-Path $smw) { Move-Item -Force $smw (Join-Path $bin "smw.old.exe") }
+if (Test-Path $smw) { Move-Item -Force $smw (Join-Path $bin "smw.old.$stamp.exe") }
 Copy-Item "target\release\smw.exe" $smw -Force
 Write-Host "Web bridge deployed to $bin"
+Write-Host "If an smw instance is running, restart it to load the new embedded UI."
 Write-Host "smw is not started at logon. Start it manually, for example:"
 Write-Host "  smw --token <token>"
 Write-Host "then open http://127.0.0.1:8787 (the default bind address)."
@@ -127,6 +129,6 @@ if (-not $RestartDaemon) {
 
 # Stop the daemon before copying: a running image cannot be overwritten.
 Stop-Process -Id $prodDaemons.Id -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
+$prodDaemons | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 Copy-Item "target\release\smd.exe" $smd -Force
 Start-Daemon

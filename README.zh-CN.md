@@ -25,7 +25,8 @@ shell 都继续跑；重新连上后 `sm continue <名字>` 就回到同一个 s
 ## 环境要求
 
 - Windows 10 1809+ 或 Windows 11（需要 ConPTY）
-- 从源码构建需要 Rust 1.74+
+- 从源码构建需要 Rust 1.89+
+- 从源码构建网页 UI 需要 Node.js 22.12+（`deploy.ps1` 会自动构建）
 
 ## 安装
 
@@ -37,7 +38,8 @@ shell 都继续跑；重新连上后 `sm continue <名字>` 就回到同一个 s
 只有交互桌面才能承载 GUI 窗口：
 
 ```powershell
-schtasks /create /tn smd /tr "wscript.exe \"$env:USERPROFILE\bin\smd-launch.vbs\"" /sc onlogon /it /f
+$vbs = "$env:USERPROFILE\bin\smd-launch.vbs"
+schtasks /create /tn smd /tr ('wscript.exe "{0}"' -f $vbs) /sc onlogon /it /f
 schtasks /run /tn smd
 ```
 
@@ -50,6 +52,11 @@ git clone https://github.com/sparkjokerben/shell-manager
 cd shell-manager
 .\deploy.ps1
 ```
+
+`deploy.ps1` 会立即替换 `sm.exe` 与 `smw.exe`。只有当已安装的 `smd.exe` 没有在
+运行、或它没有任何会话时，脚本才会替换守护进程；要重启正在运行的守护进程必须
+显式传 `-RestartDaemon`，它会结束所有托管的 shell。正在运行的 `smw` 也会继续
+提供旧的内嵌界面，直到重启。
 
 ## 用法
 
@@ -108,11 +115,13 @@ smw 0.1.1 instance=prod listening on http://127.0.0.1:8787 (token off)
 选项：
 
 ```text
-smw [--bind <地址>] [--port <端口>] [--token <令牌>] [--instance <名字>] [-h] [-V]
+smw [--bind <地址>] [--port <端口>] [--token <令牌>] [--instance <名字>]
+    [--allow-insecure] [-h] [-V]
   --bind <地址>      监听地址（默认：127.0.0.1）
   --port <端口>      监听端口（默认：8787）
-  --token <令牌>     API 令牌（默认取 $SMW_TOKEN）
+  --token <令牌>     API 令牌（默认取 $SMW_TOKEN；建议用环境变量）
   --instance <名字>  实例命名空间（覆盖 $SM_INSTANCE）
+  --allow-insecure   允许非回环绑定且不设令牌（危险）
   -h, --help         显示帮助
   -V, --version      显示版本
 ```
@@ -137,15 +146,23 @@ JSON API 与客户端命令一一对应：
 
 ### 安全
 
-默认没有令牌时所有请求都会被接受，这只有在 `smw` 仅监听 `127.0.0.1` 时才是
-安全的。用 `--token` 或 `SMW_TOKEN` 设置令牌后，HTTP 请求需要
-`Authorization: Bearer <令牌>` 或 `X-SMW-Token: <令牌>`，WebSocket 升级还可以
-使用 `?token=`。静态页与 `/api/health` 不需要令牌，以便浏览器先加载页面并
-得知是否需要认证。浏览器 WebSocket 无法自定义请求头，所以令牌会出现在 URL
-查询串里；请把这个 URL 当作秘密保管。
+默认没有令牌时所有请求都会被接受。`smw` 默认只绑定 `127.0.0.1`，因此不在网络上
+暴露——但**回环地址不是用户边界**：多用户机器上的其他本地账户仍能访问该端口，
+网页也可以向它发起 WebSocket。共享机器上请设置令牌（`--token`，更推荐
+`SMW_TOKEN` 环境变量）。
 
-不要把没有令牌的 `smw` 暴露到本机之外。用 `--bind 0.0.0.0` 绑定或转发端口
-属于使用者的责任。
+设置令牌后，HTTP 请求需要 `Authorization: Bearer <令牌>` 或
+`X-SMW-Token: <令牌>`，WebSocket 升级还可以使用 `?token=`。静态页与
+`/api/health` 不需要令牌，以便浏览器先加载页面并得知是否需要认证。浏览器
+WebSocket 无法自定义请求头，所以令牌会出现在 URL 查询串里；请把这个 URL 当作
+秘密保管，并避免让它进入访问日志。
+
+`smw` 会校验每个 API/WebSocket 请求的 `Origin`/`Host`：浏览器来源必须与 `Host`
+一致；无令牌的回环监听还会拒绝非回环主机名（防 DNS rebinding）。不带 `Origin`
+的本地脚本允许通过。非回环绑定且没有令牌时，除非显式传 `--allow-insecure`，
+否则拒绝启动。
+
+不要把没有令牌的 `smw` 暴露到本机之外。转发端口（包括经 frp）属于使用者的责任。
 
 ### frp
 
@@ -165,9 +182,12 @@ localPort = 8787
 remotePort = 18787
 ```
 
-公网部署必须设置令牌（`--token` 或 `SMW_TOKEN`），并且建议在 `frps` 侧启用
-TLS（`frps.toml` 中的 `transport.tls`），让终端流量加密传输。不要转发没有
-令牌的 `smw` 端口。
+公网部署必须设置令牌（`--token`，更推荐 `SMW_TOKEN`）。注意 `transport.tls`
+只加密 frpc 与 frps 之间的隧道；`type = "tcp"` 时，浏览器到 `frps` 公网端口
+这一段仍是明文 HTTP/WebSocket，URL 中的令牌和全部终端流量都可能被读取。请在
+`frps` 前面终止 TLS（例如 `vhostHTTPSPort` 配合 `https2http` 插件，或
+nginx/Caddy 反向代理）并使用 `https://`/`wss://`，或把隧道放进 VPN。代理访问
+日志需要脱敏查询串。不要转发没有令牌的 `smw` 端口。
 
 ### 限制
 
@@ -244,6 +264,8 @@ cargo run --bin sm -- ls # 连接这个开发守护进程
   选中的 shell、每次建会话的结果
 - `%TEMP%\sm-client.log`（非生产实例为 `%TEMP%\sm-client-<实例>.log`）——
   客户端构建号、控制台模式、stdin 原始字节与脱附判定
+- `%TEMP%\smw.log`（非生产实例为 `%TEMP%\smw-<实例>.log`）——网页桥接启动、
+  会话操作、附着/脱附与错误（不记录令牌或按键内容）
 
 ## 许可证
 

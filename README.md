@@ -27,7 +27,8 @@ sessions cannot host PowerShell or anything that needs the Windows desktop.
 ## Requirements
 
 - Windows 10 1809+ or Windows 11 (ConPTY is required).
-- Rust 1.74+ if you build from source.
+- Rust 1.89+ if you build from source.
+- Node.js 22.12+ if you build the web UI from source (`deploy.ps1` builds it for you).
 
 ## Install
 
@@ -41,7 +42,8 @@ because ConPTY children inherit its session and only the interactive desktop can
 host GUI windows:
 
 ```powershell
-schtasks /create /tn smd /tr "wscript.exe \"$env:USERPROFILE\bin\smd-launch.vbs\"" /sc onlogon /it /f
+$vbs = "$env:USERPROFILE\bin\smd-launch.vbs"
+schtasks /create /tn smd /tr ('wscript.exe "{0}"' -f $vbs) /sc onlogon /it /f
 schtasks /run /tn smd
 ```
 
@@ -55,6 +57,11 @@ git clone https://github.com/sparkjokerben/shell-manager
 cd shell-manager
 .\deploy.ps1
 ```
+
+`deploy.ps1` replaces `sm.exe` and `smw.exe` immediately. It only replaces
+`smd.exe` when the installed daemon is not running or hosts no sessions; a
+running daemon is restarted only with `-RestartDaemon`, which ends every hosted
+shell. A running `smw` keeps serving the old embedded UI until it is restarted.
 
 ## Usage
 
@@ -119,11 +126,13 @@ smw 0.1.1 instance=prod listening on http://127.0.0.1:8787 (token off)
 Options:
 
 ```text
-smw [--bind <addr>] [--port <port>] [--token <token>] [--instance <name>] [-h] [-V]
+smw [--bind <addr>] [--port <port>] [--token <token>] [--instance <name>]
+    [--allow-insecure] [-h] [-V]
   --bind <addr>      address to listen on (default: 127.0.0.1)
   --port <port>      TCP port to listen on (default: 8787)
-  --token <token>    API token (default: $SMW_TOKEN)
+  --token <token>    API token (default: $SMW_TOKEN; prefer the env var)
   --instance <name>  instance namespace (overrides $SM_INSTANCE)
+  --allow-insecure   allow a non-loopback bind without a token (dangerous)
   -h, --help         show help
   -V, --version      show the version
 ```
@@ -149,17 +158,27 @@ The JSON API mirrors the client commands:
 
 ### Security
 
-Without a token every request is accepted, which is only safe because `smw`
-listens on `127.0.0.1` by default. Set a token with `--token` or `SMW_TOKEN` to
-require authentication. Then HTTP requests need `Authorization: Bearer <token>`
-or `X-SMW-Token: <token>`, and WebSocket upgrades also accept `?token=`. The
-static page and `/api/health` stay public so the browser can load the UI and
-learn whether a token is configured. Browser WebSocket clients cannot send
-custom headers, so the token appears in the URL query string; treat that URL as
-a secret.
+Without a token every request is accepted. `smw` binds to `127.0.0.1` by default,
+which keeps it off the network - but loopback is not a user boundary: on a
+multi-user machine another local account can reach the port, and a web page can
+open a WebSocket to it. Set a token (`--token` or, preferably, `SMW_TOKEN`) on
+shared machines.
 
-Never expose a tokenless `smw` beyond the local machine. Binding with
-`--bind 0.0.0.0` or forwarding the port is your responsibility.
+With a token, HTTP requests need `Authorization: Bearer <token>` or
+`X-SMW-Token: <token>`, and WebSocket upgrades also accept `?token=`. The static
+page and `/api/health` stay public so the browser can load the UI and learn
+whether a token is configured. Browser WebSocket clients cannot send custom
+headers, so the token appears in the URL query string; treat that URL as a
+secret and keep it out of access logs.
+
+`smw` validates `Origin`/`Host` on every API and WebSocket request: a browser
+origin must match the `Host`, and a tokenless loopback listener also rejects
+non-loopback host names (DNS rebinding). Scripts that send no `Origin` are
+allowed. Binding to a non-loopback address without a token is refused unless
+`--allow-insecure` is passed explicitly.
+
+Never expose a tokenless `smw` beyond the local machine. Forwarding the port
+(including through frp) is your responsibility.
 
 ### frp
 
@@ -179,9 +198,14 @@ localPort = 8787
 remotePort = 18787
 ```
 
-A public deployment must set a token (`--token` or `SMW_TOKEN`), and you should
-enable TLS on the `frps` side (`transport.tls` in `frps.toml`) so the terminal
-traffic is encrypted. Do not forward a tokenless `smw` port.
+A public deployment must set a token (`--token`, or preferably `SMW_TOKEN`).
+Note what `transport.tls` does: it encrypts only the frpc-to-frps tunnel. A
+`type = "tcp"` proxy still exposes plain HTTP/WebSocket from the browser to
+`frps`, so the token in the URL and all terminal traffic are readable on that
+leg. Terminate TLS in front of frps (for example with `vhostHTTPSPort` and the
+`https2http` plugin, or with nginx/Caddy) and use `https://`/`wss://`, or put the
+tunnel behind a VPN. Redact query strings in proxy access logs. Do not forward a
+tokenless `smw` port.
 
 ### Limitations
 
@@ -269,6 +293,8 @@ terminal ── sm.exe ──┬── control pipe ──┐
   daemon start, resolved shell, per-session start results.
 - `%TEMP%\sm-client.log` (or `%TEMP%\sm-client-<instance>.log`) - client build
   id, console modes, raw stdin bytes and detach decisions.
+- `%TEMP%\smw.log` (or `%TEMP%\smw-<instance>.log`) - web bridge start, session
+  operations, attach/detach and errors (never tokens or key content).
 
 ## License
 
