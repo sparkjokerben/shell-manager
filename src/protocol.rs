@@ -159,9 +159,23 @@ pub fn client_log_file_for(instance: &str) -> String {
     }
 }
 
+/// Web bridge log file name for `instance`, placed in `%TEMP%`.
+pub fn smw_log_file_for(instance: &str) -> String {
+    if instance == "prod" {
+        "smw.log".to_string()
+    } else {
+        format!("smw-{}.log", instance)
+    }
+}
+
 /// Daemon log file name for this process.
 pub fn daemon_log_file() -> String {
     daemon_log_file_for(instance())
+}
+
+/// Web bridge log file name for this process.
+pub fn smw_log_file() -> String {
+    smw_log_file_for(instance())
 }
 
 /// Client log file name for this process.
@@ -451,6 +465,7 @@ mod tests {
         );
         assert_eq!(daemon_log_file_for("prod"), "smd.log");
         assert_eq!(client_log_file_for("prod"), "sm-client.log");
+        assert_eq!(smw_log_file_for("prod"), "smw.log");
     }
 
     #[test]
@@ -467,6 +482,7 @@ mod tests {
         );
         assert_eq!(daemon_log_file_for("dev"), "smd-dev.log");
         assert_eq!(client_log_file_for("dev"), "sm-client-dev.log");
+        assert_eq!(smw_log_file_for("dev"), "smw-dev.log");
     }
 
     #[test]

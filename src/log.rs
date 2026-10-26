@@ -8,15 +8,28 @@ use std::io::Write;
 
 const MAX_BYTES: u64 = 1024 * 1024;
 
-pub fn info(msg: &str) {
-    let path = std::env::temp_dir().join(crate::protocol::daemon_log_file());
+/// Append one line to `file` in `%TEMP%`, starting over once it grows past the
+/// size cap. Best-effort: I/O errors are ignored.
+pub fn write_to(file: &str, msg: &str) {
+    let path = std::env::temp_dir().join(file);
 
     // Keep the file bounded: start over once it grows past the cap.
-    if std::fs::metadata(&path).map(|m| m.len() > MAX_BYTES).unwrap_or(false) {
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > MAX_BYTES)
+        .unwrap_or(false)
+    {
         let _ = std::fs::remove_file(&path);
     }
 
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "{}", msg);
     }
+}
+
+pub fn info(msg: &str) {
+    write_to(&crate::protocol::daemon_log_file(), msg);
 }
