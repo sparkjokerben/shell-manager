@@ -119,6 +119,11 @@ impl Session {
         Ok(())
     }
 
+    /// Resize the underlying pseudo console to match the client terminal.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.pty.lock().unwrap().resize(cols, rows)
+    }
+
     /// Stop the session: signal and cancel both directional threads.
     pub fn stop(&self) -> Result<()> {
         *self.state.lock().unwrap() = SessionState::Stopped;

@@ -219,6 +219,18 @@ impl Pty {
         Ok(avail)
     }
 
+    /// Resize the pseudo console buffer.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        unsafe {
+            windows::Win32::System::Console::ResizePseudoConsole(
+                self.hpc,
+                COORD { X: cols as i16, Y: rows as i16 },
+            )
+            .context("ResizePseudoConsole failed")?;
+        }
+        Ok(())
+    }
+
     /// Whether the child shell process is still running.
     pub fn is_running(&self) -> bool {
         match &self.process {

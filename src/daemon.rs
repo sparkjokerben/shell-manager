@@ -139,14 +139,20 @@ fn handle_control_connection(pipe: HANDLE, sessions: SessionTable) -> Result<()>
 /// Dispatch a request to the appropriate session operation.
 fn dispatch(req: &Request, sessions: &SessionTable) -> Response {
     match req.op {
-        Op::Start => handle_start(&req.name, req.wsl, sessions),
-        Op::Continue => handle_continue(&req.name, sessions),
+        Op::Start => handle_start(&req.name, req.wsl, req.cols, req.rows, sessions),
+        Op::Continue => handle_continue(&req.name, req.cols, req.rows, sessions),
         Op::List => handle_list(sessions),
         Op::Stop => handle_stop(&req.name, sessions),
     }
 }
 
-fn handle_start(name: &str, wsl: Option<bool>, sessions: &SessionTable) -> Response {
+fn handle_start(
+    name: &str,
+    wsl: Option<bool>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    sessions: &SessionTable,
+) -> Response {
     let mut table = sessions.lock().unwrap();
     if table.contains_key(name) {
         return Response::err(format!("session '{}' already exists", name));
@@ -159,7 +165,9 @@ fn handle_start(name: &str, wsl: Option<bool>, sessions: &SessionTable) -> Respo
         "pwsh.exe".to_string()
     };
 
-    match Session::new(name, 120, 40, &cmd) {
+    let (c, r) = (cols.unwrap_or(120), rows.unwrap_or(40));
+
+    match Session::new(name, c, r, &cmd) {
         Ok(session) => {
             let session_id = session.session_id.clone();
             let (pipe_out, pipe_in) = session.data_pipe_paths();
@@ -179,23 +187,27 @@ fn handle_start(name: &str, wsl: Option<bool>, sessions: &SessionTable) -> Respo
     }
 }
 
-fn handle_continue(name: &str, sessions: &SessionTable) -> Response {
+fn handle_continue(
+    name: &str,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    sessions: &SessionTable,
+) -> Response {
     let mut table = sessions.lock().unwrap();
     let session = match table.get_mut(name) {
         Some(s) => s,
         None => return Response::err(format!("session '{}' not found", name)),
     };
 
-    // Ensure data pipe is listening.
-    if matches!(
-        *session.state.lock().unwrap(),
-        SessionState::Created | SessionState::Detached
-    ) {
-        if let Err(e) = session.start_data_pipe_listener() {
-            return Response::err(format!("failed to start data pipe: {}", e));
+    // Match the existing shell to the client's terminal size.
+    if let (Some(c), Some(r)) = (cols, rows) {
+        if let Err(e) = session.resize(c, r) {
+            eprintln!("[daemon] resize failed: {}", e);
         }
     }
 
+    // The directional listener threads were started at session creation and
+    // loop back to accept the next client, so nothing else is needed here.
     let session_id = session.session_id.clone();
     let (pipe_out, pipe_in) = session.data_pipe_paths();
 

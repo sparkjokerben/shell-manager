@@ -22,6 +22,11 @@ pub struct Request {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wsl: Option<bool>,
+    /// Client terminal width/height (columns, rows), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
