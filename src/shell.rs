@@ -6,7 +6,7 @@
 //! one that actually starts: a Store alias is an MSIX app, so starting it needs
 //! an interactive session and fails with ERROR_ACCESS_DENIED in session 0.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Shell commands to try, in order, for a default session.
 pub fn shell_candidates() -> Vec<String> {
@@ -73,7 +73,7 @@ fn path_pwsh() -> Option<PathBuf> {
 
 /// First existing candidate, or the last one when none exists.
 #[cfg(test)]
-fn pick<F: Fn(&Path) -> bool>(candidates: &[PathBuf], exists: F) -> PathBuf {
+fn pick<F: Fn(&std::path::Path) -> bool>(candidates: &[PathBuf], exists: F) -> PathBuf {
     candidates
         .iter()
         .find(|p| exists(p))

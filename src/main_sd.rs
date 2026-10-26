@@ -278,7 +278,9 @@ fn hex_short(bytes: &[u8]) -> String {
 
 /// Detach triggers. The printable sequence works from any keyboard and is not
 /// consumed by ssh (unlike "~."); F12 and Ctrl+] are kept as extras.
-const DETACH_SEQS: &[&[u8]] = &[b"@@detach", b"\x1b[24~", b"\x1d"];
+/// Keys that detach the client. Ctrl+] is the control byte GS; F12 is the VT
+/// sequence. A Win32-input-mode report for either is handled separately.
+const DETACH_SEQS: &[&[u8]] = &[b"\x1b[24~", b"\x1d"];
 
 /// Disable terminal mouse reporting. A TUI that exits without restoring its
 /// mouse mode otherwise leaves the terminal sending SGR mouse reports, which
@@ -416,26 +418,19 @@ fn partial_suffix(data: &[u8], needle: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// Recognises the detach triggers inside Win32-input-mode key reports.
+/// Recognises the detach keys inside Win32-input-mode key reports.
 ///
 /// A terminal that honours `CSI ? 9001 h` sends every key as
-/// `CSI Vk;Sc;Uc;Kd;Cs;Rc _` instead of plain bytes. The client keeps terminals
-/// out of that mode (see `WIN32_INPUT_OFF`), but one that was already switched -
-/// or that ignores the reset - keeps encoding keystrokes this way, so the
-/// triggers are recognised here too.
+/// `CSI Vk;Sc;Uc;Kd;Cs;Rc _` instead of plain bytes, so neither the control byte
+/// nor the F12 sequence in `DETACH_SEQS` ever appears.
 struct Win32Detach {
-    /// Printable characters seen recently, for matching the typed trigger.
-    typed: Vec<u8>,
     /// Trailing bytes that may start a report split across reads.
     carry: Vec<u8>,
 }
 
 impl Win32Detach {
     fn new() -> Self {
-        Self {
-            typed: Vec::new(),
-            carry: Vec::new(),
-        }
+        Self { carry: Vec::new() }
     }
 
     fn feed(&mut self, data: &[u8]) -> bool {
@@ -461,7 +456,7 @@ impl Win32Detach {
                 break;
             }
             if buf[j] == b'_' {
-                hit |= self.inspect(&buf[i + 2..j]);
+                hit |= is_detach_report(&buf[i + 2..j]);
                 i = j + 1;
             } else {
                 i += 1;
@@ -469,41 +464,32 @@ impl Win32Detach {
         }
         hit
     }
+}
 
-    /// `params` holds the text between `CSI` and the `_` terminator.
-    fn inspect(&mut self, params: &[u8]) -> bool {
-        let Ok(text) = std::str::from_utf8(params) else {
-            return false;
-        };
-        let fields: Vec<u32> = text
-            .split(';')
-            .filter_map(|f| f.parse::<u32>().ok())
-            .collect();
-        // Vk;Sc;Uc;Kd;Cs;Rc
-        if fields.len() != 6 {
-            return false;
-        }
-        let (uc, kd, cs) = (fields[2], fields[3], fields[4]);
-        if kd == 0 {
-            return false; // key-up: the key-down already carried the character
-        }
-        let ctrl = cs & (4 | 8) != 0; // RIGHT_CTRL_PRESSED | LEFT_CTRL_PRESSED
-        if ctrl && (uc == 0x1d || uc == 0x5d) {
-            return true; // Ctrl+]
-        }
-        if !ctrl && uc != 0 {
-            if let Some(ch) = char::from_u32(uc) {
-                let mut utf8 = [0u8; 4];
-                self.typed.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
-                if self.typed.len() > 16 {
-                    let cut = self.typed.len() - 16;
-                    self.typed.drain(..cut);
-                }
-                return self.typed.ends_with(b"@@detach");
-            }
-        }
-        false
+/// `params` holds the text between `CSI` and the `_` terminator.
+fn is_detach_report(params: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(params) else {
+        return false;
+    };
+    let fields: Vec<u32> = text
+        .split(';')
+        .filter_map(|f| f.parse::<u32>().ok())
+        .collect();
+    // Vk;Sc;Uc;Kd;Cs;Rc
+    if fields.len() != 6 {
+        return false;
     }
+    let (vk, uc, kd, cs) = (fields[0], fields[2], fields[3], fields[4]);
+    if kd == 0 {
+        return false; // key-up
+    }
+    const VK_F12: u32 = 0x7B;
+    if vk == VK_F12 {
+        return true;
+    }
+    // LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED
+    let ctrl = cs & (4 | 8) != 0;
+    ctrl && (uc == 0x1d || uc == 0x5d)
 }
 
 /// Removes hover-only mouse motion reports (SGR and X10 encodings).
@@ -611,7 +597,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
 
     // Print before connecting: once connected, the daemon starts streaming PTY
     // output, and mixing console-wide prints with raw byte writes garbles the line.
-    println!("\r\nattached ({}, detach: type @@detach)", CLIENT_BUILD);
+    println!("\r\nattached ({}, detach: Ctrl+] or F12)", CLIENT_BUILD);
     // Start from a clean terminal state, then restore the mouse modes the
     // hosted app had enabled before this client attached.
     if has_console {
@@ -961,33 +947,6 @@ mod tests {
     use super::{filter_motion, strip_win32_input_mode, DetachDetector, Win32Detach};
 
     #[test]
-    fn magic_sequence_detaches() {
-        let mut d = DetachDetector::new();
-        let (out, detach) = d.feed(b"@@detach");
-        assert!(detach);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn magic_sequence_after_text_forwards_prefix() {
-        let mut d = DetachDetector::new();
-        let (out, detach) = d.feed(b"abc@@detach");
-        assert!(detach);
-        assert_eq!(&out[..], b"abc");
-    }
-
-    #[test]
-    fn magic_sequence_split_across_reads() {
-        let mut d = DetachDetector::new();
-        let (out, detach) = d.feed(b"ab@@det");
-        assert!(!detach);
-        assert_eq!(&out[..], b"ab");
-        let (out, detach) = d.feed(b"ach");
-        assert!(detach);
-        assert!(out.is_empty());
-    }
-
-    #[test]
     fn f12_detaches() {
         let mut d = DetachDetector::new();
         let (out, detach) = d.feed(b"\x1b[24~");
@@ -1130,26 +1089,23 @@ mod tests {
     }
 
     #[test]
-    fn win32_typed_trigger_detaches() {
-        let mut d = Win32Detach::new();
-        let mut hit = false;
-        for ch in "@@detach".chars() {
-            hit |= d.feed(&win32_report(0, ch as u32, 0, 1));
-        }
-        assert!(hit);
-    }
-
-    #[test]
     fn win32_ctrl_bracket_detaches() {
         let mut d = Win32Detach::new();
         assert!(d.feed(&win32_report(221, 0x1d, 8, 1)));
     }
 
     #[test]
-    fn win32_keyup_and_partial_text_do_not_detach() {
+    fn win32_f12_detaches() {
+        let mut d = Win32Detach::new();
+        assert!(d.feed(&win32_report(0x7b, 0, 0, 1)));
+    }
+
+    #[test]
+    fn win32_keyup_and_ordinary_keys_do_not_detach() {
         let mut d = Win32Detach::new();
         assert!(!d.feed(&win32_report(221, 0x1d, 8, 0))); // key-up
-        for ch in "@@deta".chars() {
+        assert!(!d.feed(&win32_report(0x7b, 0, 0, 0))); // F12 key-up
+        for ch in "@@detach".chars() {
             assert!(!d.feed(&win32_report(0, ch as u32, 0, 1)));
         }
     }
