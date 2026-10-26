@@ -228,6 +228,10 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
     anyhow::bail!("timed out connecting to data pipe {}", name)
 }
 
+/// Bumped whenever the client's input handling changes, so a stale attach is
+/// easy to spot in the banner.
+const CLIENT_BUILD: &str = "client 2026-10-26b";
+
 /// Detach triggers. The printable sequence works from any keyboard and is not
 /// consumed by ssh (unlike "~."); F12 and Ctrl+] are kept as extras.
 const DETACH_SEQS: &[&[u8]] = &[b"@@detach", b"\x1b[24~", b"\x1d"];
@@ -408,7 +412,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
 
     // Print before connecting: once connected, the daemon starts streaming PTY
     // output, and mixing console-wide prints with raw byte writes garbles the line.
-    println!("\r\nattached (detach: type @@detach)");
+    println!("\r\nattached ({}, detach: type @@detach)", CLIENT_BUILD);
     // Start from a clean terminal state, then restore the mouse modes the
     // hosted app had enabled before this client attached.
     if has_console {
