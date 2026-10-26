@@ -1,0 +1,248 @@
+//! Daemon: the long-running shell-daemon process.
+//!
+//! Maintains a session table and serves control-pipe requests (START / CONTINUE / LIST / STOP).
+
+use crate::protocol::{Op, Request, Response, SessionInfo};
+use crate::session::{Session, SessionState};
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+use windows::Win32::System::Pipes::{
+    CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe,
+    PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_WAIT,
+    PIPE_UNLIMITED_INSTANCES, NMPWAIT_WAIT_FOREVER,
+};
+use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+
+/// Shared session table: session name -> Session.
+type SessionTable = Arc<Mutex<HashMap<String, Session>>>;
+
+pub struct Daemon {
+    sessions: SessionTable,
+    control_pipe: HANDLE,
+}
+
+const CONTROL_PIPE: &str = r"\\.\pipe\shell-daemon\control";
+
+impl Daemon {
+    pub fn new() -> Result<Self> {
+        let wide: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(
+            std::ffi::OsStr::new(CONTROL_PIPE),
+        )
+        .chain(Some(0))
+        .collect();
+
+        let h = unsafe {
+            CreateNamedPipeW(
+                windows::core::PCWSTR::from_raw(wide.as_ptr()),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                4096,
+                4096,
+                NMPWAIT_WAIT_FOREVER,
+                None,
+            )
+        };
+        if h.is_invalid() {
+            anyhow::bail!("CreateNamedPipe (control) failed");
+        }
+
+        Ok(Daemon {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            control_pipe: h,
+        })
+    }
+
+    /// Main loop: accept control-pipe connections and serve requests.
+    pub fn run(&mut self) -> Result<()> {
+        println!("shell-daemon listening on {}", CONTROL_PIPE);
+
+        loop {
+            let connected = unsafe { ConnectNamedPipe(self.control_pipe, None).is_ok() };
+            if !connected {
+                // Brief retry loop
+                continue;
+            }
+
+            let sessions = self.sessions.clone();
+            let pipe = self.control_pipe;
+
+            thread::spawn(move || -> anyhow::Result<()> {
+                let _ = handle_control_connection(pipe, sessions);
+                // Reconnect the server pipe instance for the next client.
+                unsafe { DisconnectNamedPipe(pipe) }.ok();
+                Ok(())
+            });
+        }
+    }
+}
+
+/// Handle one control-pipe connection: read one request, send one response, disconnect.
+fn handle_control_connection(pipe: HANDLE, sessions: SessionTable) -> Result<()> {
+    // Read length prefix (4 bytes LE).
+    let mut len_buf = [0u8; 4];
+    let mut read: u32 = 0;
+    unsafe {
+        ReadFile(
+            pipe,
+            Some(&mut len_buf),
+            Some(&mut read),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("ReadFile failed: {}", e))?;
+    }
+    if read < 4 {
+        anyhow::bail!("short read on request length");
+    }
+    let req_len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut req_buf = vec![0u8; req_len];
+    unsafe {
+        ReadFile(
+            pipe,
+            Some(&mut req_buf),
+            Some(&mut read),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("ReadFile failed: {}", e))?;
+    }
+
+    let req: Request = serde_json::from_slice(&req_buf)
+        .context("failed to parse request JSON")?;
+
+    let response = dispatch(&req, &sessions);
+
+    let payload = serde_json::to_vec(&response)?;
+    let mut buf = Vec::with_capacity(4 + payload.len());
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&payload);
+
+    let mut written: u32 = 0;
+    unsafe {
+        WriteFile(
+            pipe,
+            Some(&buf),
+            Some(&mut written),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("WriteFile failed: {}", e))?;
+    }
+
+    unsafe {
+        let _ = DisconnectNamedPipe(pipe);
+    }
+
+    Ok(())
+}
+
+/// Dispatch a request to the appropriate session operation.
+fn dispatch(req: &Request, sessions: &SessionTable) -> Response {
+    match req.op {
+        Op::Start => handle_start(&req.name, req.wsl, sessions),
+        Op::Continue => handle_continue(&req.name, sessions),
+        Op::List => handle_list(sessions),
+        Op::Stop => handle_stop(&req.name, sessions),
+    }
+}
+
+fn handle_start(name: &str, wsl: Option<bool>, sessions: &SessionTable) -> Response {
+    let mut table = sessions.lock().unwrap();
+    if table.contains_key(name) {
+        return Response::err(format!("session '{}' already exists", name));
+    }
+
+    let cmd = if wsl.unwrap_or(false) {
+        "wsl.exe".to_string()
+    } else {
+        "powershell.exe".to_string()
+    };
+
+    match Session::new(name, 120, 40, &cmd) {
+        Ok(session) => {
+            let session_id = session.session_id.clone();
+            let pipe_name = session.data_pipe_path();
+            if let Err(e) = session.start_data_pipe_listener() {
+                return Response::err(format!("failed to start data pipe: {}", e));
+            }
+            table.insert(name.to_string(), session);
+
+            let data = serde_json::json!({
+                "session_id": session_id,
+                "pipe_name": pipe_name,
+            });
+            Response::ok(Some(data))
+        }
+        Err(e) => Response::err(format!("failed to create session: {}", e)),
+    }
+}
+
+fn handle_continue(name: &str, sessions: &SessionTable) -> Response {
+    let mut table = sessions.lock().unwrap();
+    let session = match table.get_mut(name) {
+        Some(s) => s,
+        None => return Response::err(format!("session '{}' not found", name)),
+    };
+
+    // Ensure data pipe is listening.
+    if matches!(
+        *session.state.lock().unwrap(),
+        SessionState::Created | SessionState::Detached
+    ) {
+        if let Err(e) = session.start_data_pipe_listener() {
+            return Response::err(format!("failed to start data pipe: {}", e));
+        }
+    }
+
+    let session_id = session.session_id.clone();
+    let pipe_name = session.data_pipe_path();
+
+    let data = serde_json::json!({
+        "session_id": session_id,
+        "pipe_name": pipe_name,
+    });
+    Response::ok(Some(data))
+}
+
+fn handle_list(sessions: &SessionTable) -> Response {
+    let table = sessions.lock().unwrap();
+    let infos: Vec<SessionInfo> = table
+        .iter()
+        .map(|(name, session)| {
+            let attached = matches!(
+                *session.state.lock().unwrap(),
+                SessionState::Attached
+            );
+            SessionInfo {
+                name: name.clone(),
+                session_id: session.session_id.clone(),
+                attached,
+            }
+        })
+        .collect();
+
+    Response::ok(Some(serde_json::to_value(infos).unwrap()))
+}
+
+fn handle_stop(name: &str, sessions: &SessionTable) -> Response {
+    let mut table = sessions.lock().unwrap();
+    if let Some(session) = table.remove(name) {
+        if let Err(e) = session.stop() {
+            return Response::err(format!("failed to stop session: {}", e));
+        }
+        Response::ok(None)
+    } else {
+        Response::err(format!("session '{}' not found", name))
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.control_pipe);
+        }
+    }
+}
