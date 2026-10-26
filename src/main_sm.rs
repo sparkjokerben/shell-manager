@@ -32,7 +32,7 @@ usage: sm [name]          attach to <name>, creating it if needed
 options: --wsl  create the session with wsl.exe instead of PowerShell
 environment: SM_INSTANCE  use an isolated namespace for pipes, mutex and logs
                           (1-32 chars of A-Z a-z 0-9 - _; default: prod, or dev
-                          for binaries built under target/)";
+                          when the executable runs under target/)";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]

@@ -43,9 +43,24 @@ function Start-Daemon {
     Write-Host "Daemon started in the interactive session (task 'smd')."
 }
 
-if (-not (Get-Process smd -ErrorAction SilentlyContinue)) {
+$smd = Join-Path $bin "smd.exe"
+
+# A development daemon (run from target\debug or target\release) has the same
+# image name but its own instance namespace and its own sessions. Only the
+# installed copy at $smd is the production daemon, so probe and stop by image
+# path instead of by process name.
+function Get-ProdDaemon {
+    Get-Process -Name smd -ErrorAction SilentlyContinue | Where-Object {
+        $path = $null
+        try { $path = $_.Path } catch { }
+        $path -and ($path -ieq $smd)
+    }
+}
+
+$prodDaemons = @(Get-ProdDaemon)
+if ($prodDaemons.Count -eq 0) {
     # Nothing running, nothing to protect.
-    Copy-Item "target\release\smd.exe" (Join-Path $bin "smd.exe") -Force
+    Copy-Item "target\release\smd.exe" $smd -Force
     Start-Daemon
     exit 0
 }
@@ -77,7 +92,7 @@ if (-not $RestartDaemon) {
 }
 
 # Stop the daemon before copying: a running image cannot be overwritten.
-Stop-Process -Name smd -Force -ErrorAction SilentlyContinue
+Stop-Process -Id $prodDaemons.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
-Copy-Item "target\release\smd.exe" (Join-Path $bin "smd.exe") -Force
+Copy-Item "target\release\smd.exe" $smd -Force
 Start-Daemon
