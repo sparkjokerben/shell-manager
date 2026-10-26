@@ -230,7 +230,51 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 
 /// Bumped whenever the client's input handling changes, so a stale attach is
 /// easy to spot in the banner.
-const CLIENT_BUILD: &str = "client 2026-10-26b";
+const CLIENT_BUILD: &str = "client 2026-10-26c";
+
+/// Appends a diagnostic line to %TEMP%\sd-client.log.
+///
+/// Always on and best-effort: it records what the client actually received, so
+/// input problems can be diagnosed without reproducing them interactively.
+fn client_log(msg: &str) {
+    use std::io::Write as _;
+    use std::sync::{Mutex, OnceLock};
+
+    static LOG: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+    let slot = LOG.get_or_init(|| {
+        let path = std::env::temp_dir().join("sd-client.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok();
+        Mutex::new(file)
+    });
+    if let Ok(mut guard) = slot.lock() {
+        if let Some(file) = guard.as_mut() {
+            if file.metadata().map(|m| m.len() > 5_000_000).unwrap_or(false) {
+                let _ = file.set_len(0);
+            }
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(file, "{} {}", ms, msg);
+        }
+    }
+}
+
+fn hex_short(bytes: &[u8]) -> String {
+    let take = bytes.len().min(64);
+    let mut s = String::with_capacity(take * 3);
+    for b in &bytes[..take] {
+        s.push_str(&format!("{:02x} ", b));
+    }
+    if bytes.len() > take {
+        s.push_str("...");
+    }
+    s
+}
 
 /// Detach triggers. The printable sequence works from any keyboard and is not
 /// consumed by ssh (unlike "~."); F12 and Ctrl+] are kept as extras.
@@ -330,9 +374,13 @@ fn partial_suffix(data: &[u8], needle: &[u8]) -> usize {
 /// escape sequences into it. Clicks, wheel and drag events still pass through
 /// for the hosted TUI.
 fn filter_motion(data: &[u8], pending: &mut Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Never let a malformed/truncated report stall all keystrokes.
+    if pending.len() > 256 {
+        out.append(pending);
+    }
     let mut buf = std::mem::take(pending);
     buf.extend_from_slice(data);
-    let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
 
     while i < buf.len() {
@@ -396,6 +444,18 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     };
     // Mouse modes the hosted app had enabled when this client attached.
     let initial_mouse_on = mouse & 0b111 != 0;
+
+    client_log(&format!(
+        "attach build={} pid={} has_console={} in_mode={:#x} out_mode={:#x} mouse={} stdin={} stdout={}",
+        CLIENT_BUILD,
+        std::process::id(),
+        has_console,
+        orig_in_mode.0,
+        orig_out_mode.0,
+        mouse,
+        stdin.0,
+        stdout.0,
+    ));
 
     // The PTY stream is UTF-8. A Windows console interprets WriteFile bytes with
     // the active output code page, so switch it to UTF-8 (65001) for correct text.
@@ -558,6 +618,8 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
         let mut buf = [0u8; 4096];
         let mut detector = DetachDetector::new();
         let mut motion_pending: Vec<u8> = Vec::new();
+        let mut hover_reads: u32 = 0;
+        client_log("stdin thread started");
         loop {
             let mut read: u32 = 0;
             let r = unsafe {
@@ -569,15 +631,31 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                 )
             };
             match r {
-                Ok(()) if read == 0 => break,
+                Ok(()) if read == 0 => {
+                    client_log("stdin EOF");
+                    break;
+                }
                 Ok(()) => {
-                    let filtered = filter_motion(&buf[..read as usize], &mut motion_pending);
+                    let raw = &buf[..read as usize];
+                    let filtered = filter_motion(raw, &mut motion_pending);
                     let data = &filtered[..];
                     if data.is_empty() {
+                        hover_reads += 1;
+                        if hover_reads % 100 == 0 {
+                            client_log(&format!("hover reports dropped so far: {}", hover_reads));
+                        }
                         continue;
                     }
+                    client_log(&format!(
+                        "stdin read {}: {} | filtered {}: {}",
+                        read,
+                        hex_short(raw),
+                        data.len(),
+                        hex_short(data)
+                    ));
                     let (forward, detach) = detector.feed(data);
                     if detach {
+                        client_log("detach matched");
                         // Forward whatever preceded the key on this read before
                         // tearing the connection down.
                         if !forward.is_empty() {
@@ -588,12 +666,17 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                         break;
                     }
                     if !forward.is_empty() && !write_all(h_in, &forward)? {
+                        client_log("stdin forward failed");
                         return Ok(());
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    client_log(&format!("stdin read error: {}", e));
+                    break;
+                }
             }
         }
+        client_log("stdin thread exiting");
         Ok(())
     });
 
@@ -624,7 +707,10 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                 )
             };
             match r {
-                Ok(()) if read == 0 => break,
+                Ok(()) if read == 0 => {
+                    client_log("out pipe EOF");
+                    break;
+                }
                 Ok(()) => {
                     let chunk = &buf[..read as usize];
 
@@ -682,13 +768,20 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                         // never panic the process.
                         match write_all(stdout, &data) {
                             Ok(true) => {}
-                            _ => break,
+                            _ => {
+                                client_log("stdout write failed");
+                                break;
+                            }
                         }
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    client_log(&format!("out read error: {}", e));
+                    break;
+                }
             }
         }
+        client_log("reader thread exiting");
         reader_done.store(true, Ordering::Relaxed);
     });
 

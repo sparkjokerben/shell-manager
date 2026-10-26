@@ -173,14 +173,19 @@ fn handle_start(
     let cmd = if wsl.unwrap_or(false) {
         "wsl.exe".to_string()
     } else {
-        // 默认 PowerShell 7 (pwsh.exe)，不使用 PowerShell 5.1 (powershell.exe)
-        "pwsh.exe".to_string()
+        // 首选可执行的非打包版 PowerShell 7（MSI/zip 安装）；Store 版的
+        // WindowsApps 别名只能在交互会话里激活，后台会话会 ACCESS_DENIED。
+        crate::shell::default_shell()
     };
 
     let (c, r) = (cols.unwrap_or(120), rows.unwrap_or(40));
 
     match Session::new(name, c, r, &cmd) {
         Ok(session) => {
+            crate::log::info(&format!(
+                "start name={} shell={} size={}x{}",
+                name, cmd, c, r
+            ));
             let session_id = session.session_id.clone();
             let (pipe_out, pipe_in) = session.data_pipe_paths();
             if let Err(e) = session.start_data_pipe_listener() {
@@ -196,7 +201,10 @@ fn handle_start(
             });
             Response::ok(Some(data))
         }
-        Err(e) => Response::err(format!("failed to create session: {}", e)),
+        Err(e) => {
+            crate::log::info(&format!("start name={} shell={} failed: {:#}", name, cmd, e));
+            Response::err(format!("failed to create session: {}", e))
+        }
     }
 }
 

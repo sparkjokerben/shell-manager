@@ -1,35 +1,60 @@
 use shell_daemon::daemon::Daemon;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 
-/// Ensure only one daemon instance runs.
-///
-/// Creates a named mutex; if it already exists another instance is running.
-/// The returned handle must stay alive for the process lifetime.
-fn acquire_single_instance() -> anyhow::Result<windows::Win32::Foundation::HANDLE> {
+/// `Some(handle)` when this process created the mutex, `None` when one already
+/// existed (another daemon owns it). The handle must stay alive for the process
+/// lifetime.
+fn try_mutex(name: &str) -> anyhow::Result<Option<HANDLE>> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{GetLastError, BOOL};
-    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::Foundation::{CloseHandle, BOOL};
 
-    let name: Vec<u16> = std::ffi::OsStr::new("Local\\shell-daemon-single-instance")
+    let wide: Vec<u16> = std::ffi::OsStr::new(name)
         .encode_wide()
         .chain(Some(0))
         .collect();
+    let handle = unsafe { CreateMutexW(None, BOOL(0), PCWSTR::from_raw(wide.as_ptr()))? };
 
-    let handle = unsafe {
-        CreateMutexW(None, BOOL(0), PCWSTR::from_raw(name.as_ptr()))?
-    };
+    // CreateMutexW sets ERROR_ALREADY_EXISTS when the mutex already existed.
+    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if err == 183 {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Ok(None);
+    }
+    Ok(Some(handle))
+}
 
-    // CreateMutexW sets ERROR_ALREADY_EXISTS (183 -> HRESULT 0x800700B7) when the
-    // mutex already existed, i.e. another daemon is running.
-    let already_exists = unsafe { GetLastError() }
-        .err()
-        .map(|e| (e.code().0 as u32) == 0x8007_00B7)
-        .unwrap_or(false);
-    if already_exists {
-        anyhow::bail!("another shell-daemon instance is already running");
+/// Ensure only one daemon instance runs.
+///
+/// `Global\` also covers a daemon started in another session - an SSH window
+/// lives in session 0 while the desktop is session 1 - and a `Local\` name
+/// (per-session) let a second instance coexist and steal client requests.
+fn acquire_single_instance() -> anyhow::Result<HANDLE> {
+    match try_mutex(r"Global\shell-daemon-single-instance") {
+        Ok(Some(h)) => return Ok(h),
+        Ok(None) => anyhow::bail!("another shell-daemon instance is already running"),
+        // Creating a Global\ kernel object needs SeCreateGlobalPrivilege, which
+        // an unelevated logon session may lack; fall back to the per-session name.
+        Err(_) => {}
     }
 
-    Ok(handle)
+    match try_mutex(r"Local\shell-daemon-single-instance")? {
+        Some(h) => Ok(h),
+        None => anyhow::bail!("another shell-daemon instance is already running"),
+    }
+}
+
+/// Windows session the daemon runs in: 0 for services/SSH, 1+ for desktops.
+fn current_session() -> u32 {
+    let mut session = 0u32;
+    unsafe {
+        let _ = ProcessIdToSessionId(GetCurrentProcessId(), &mut session);
+    }
+    session
 }
 
 fn main() -> anyhow::Result<()> {
@@ -41,6 +66,14 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    let shell = shell_daemon::shell::default_shell();
+    shell_daemon::log::info(&format!(
+        "daemon start pid={} session={} shell={}",
+        std::process::id(),
+        current_session(),
+        shell
+    ));
+
     ctrlc::set_handler(move || {
         println!("\nshell-daemon shutting down...");
         std::process::exit(0);
@@ -48,7 +81,7 @@ fn main() -> anyhow::Result<()> {
     .expect("error setting Ctrl-C handler");
 
     let mut daemon = Daemon::new()?;
-    println!("shell-daemon started. Press Ctrl-C to stop.");
+    println!("shell-daemon started (session {}, shell {}).", current_session(), shell);
     daemon.run()?;
     Ok(())
 }
