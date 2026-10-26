@@ -31,7 +31,7 @@ use windows::Win32::System::Threading::{
     InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
     LPPROC_THREAD_ATTRIBUTE_LIST,
 };
-use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows::Win32::Storage::FileSystem::ReadFile;
 
 /// Builds the user's own environment block (from the registry) for the child.
 ///
@@ -226,21 +226,6 @@ impl Pty {
 
         self.process = Some(pi);
         Ok(())
-    }
-
-    /// Write input bytes to the pseudo console (sent to child's stdin).
-    pub fn write_input(&self, buf: &[u8]) -> Result<u32> {
-        let mut written: u32 = 0;
-        unsafe {
-            WriteFile(
-                self.input_write,
-                Some(buf),
-                Some(&mut written),
-                None,
-            )
-            .context("WriteFile to PTY input failed")?;
-        }
-        Ok(written)
     }
 
     /// Read output bytes from the pseudo console (from child's stdout/stderr).

@@ -355,11 +355,17 @@ fn force_repaint(name: &str) {
 /// The daemon creates a single pipe instance per direction, so a previous
 /// client that is still tearing down makes CreateFile fail with ERROR_PIPE_BUSY.
 /// Wait for the instance to become free instead of failing the attach.
+///
+/// The wait is deliberately short: two clients cannot share one session, so if
+/// the instance stays busy another client is attached and waiting longer only
+/// delays the clear failure (the caller prints the `sm detach` hint).
 fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
     const ERROR_PIPE_BUSY: u32 = 0x8007_00E7;
+    const BUSY_WAIT_MS: u32 = 500;
+    const BUSY_ATTEMPTS: u32 = 6;
     let w = wide(name);
 
-    for _ in 0..40 {
+    for _ in 0..BUSY_ATTEMPTS {
         let h = unsafe {
             CreateFileW(
                 PCWSTR::from_raw(w.as_ptr()),
@@ -376,7 +382,7 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
             Err(e) if (e.code().0 as u32) == ERROR_PIPE_BUSY => unsafe {
                 let _ = windows::Win32::System::Pipes::WaitNamedPipeW(
                     PCWSTR::from_raw(w.as_ptr()),
-                    500,
+                    BUSY_WAIT_MS,
                 );
             },
             Err(e) => anyhow::bail!("failed to connect to data pipe {}: {}", name, e),
