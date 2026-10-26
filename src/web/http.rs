@@ -345,6 +345,11 @@ async fn handle_socket(
         }
     }
 
+    // Send a close frame before tearing down: dropping the socket after an
+    // intentional detach would otherwise surface as an abnormal closure in the
+    // browser.
+    let _ = socket.send(Message::Close(None)).await;
+
     // Drop the writer handle before `shutdown` joins the writer thread;
     // otherwise `blocking_recv` could keep it alive indefinitely.
     drop(input);
