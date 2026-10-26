@@ -388,7 +388,7 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 
 /// Bumped whenever the client's input handling changes, so a stale attach is
 /// easy to spot in the banner.
-const CLIENT_BUILD: &str = "client 2026-10-26g";
+const CLIENT_BUILD: &str = "client 2026-10-26h";
 
 /// Appends a diagnostic line to %TEMP%\sm-client.log.
 ///
@@ -780,6 +780,10 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
 
     // Put the local console into raw mode so input passes through byte-for-byte.
     let mut raw_in_mode = CONSOLE_MODE(0);
+    // Whether VT output could be enabled; ESC sequences may only be written when
+    // it succeeded, otherwise they are rendered as literal garbage. Declared out
+    // here so the teardown path can consult it too.
+    let mut vt_out_ok = false;
     if has_console {
         // Raw input plus VT input, so arrows and function keys arrive as VT
         // sequences. Mouse input is enabled only when the hosted app had it on
@@ -787,6 +791,11 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
         // as the app toggles its DEC modes. Hover-only motion reports are
         // filtered out below so they do not get typed into a plain shell prompt.
         // ENABLE_EXTENDED_FLAGS is required for QUICK_EDIT_MODE to take effect.
+        // ENABLE_MOUSE_INPUT is cleared from the base mode: a fresh console has
+        // it on by default, so leaving it here would keep mouse reporting enabled
+        // even when the hosted app never asked for it (and a crash of this client
+        // would leave the bit stuck on). It is added back explicitly only when
+        // initial_mouse_on, or at runtime when the app turns a DEC mode on.
         let raw_in = (orig_in_mode.0
             | ENABLE_EXTENDED_FLAGS.0
             | ENABLE_VIRTUAL_TERMINAL_INPUT.0)
@@ -794,6 +803,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                 | ENABLE_ECHO_INPUT.0
                 | ENABLE_PROCESSED_INPUT.0
                 | ENABLE_WINDOW_INPUT.0
+                | ENABLE_MOUSE_INPUT.0
                 | ENABLE_QUICK_EDIT_MODE.0);
         raw_in_mode = CONSOLE_MODE(raw_in);
         let initial_mode = if initial_mouse_on {
@@ -807,7 +817,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
             | ENABLE_PROCESSED_OUTPUT.0
             | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0
             | DISABLE_NEWLINE_AUTO_RETURN.0;
-        let vt_out_ok = unsafe {
+        vt_out_ok = unsafe {
             if SetConsoleMode(stdin, initial_mode).is_err() {
                 // VT input unsupported on this console: fall back to plain raw mode.
                 let fallback = (orig_in_mode.0 | ENABLE_EXTENDED_FLAGS.0)
@@ -1105,7 +1115,9 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     drop(stdin_thread);
     // Leave the terminal clean: disable mouse reporting the hosted TUI may have
     // enabled, so stray reports do not get typed into the shell after detach.
-    if has_console {
+    // Only when VT output was actually enabled in the first place: otherwise the
+    // sequence would be printed as literal text.
+    if has_console && vt_out_ok {
         let _ = write_all(stdout, MOUSE_RESET);
     }
     // Plain write instead of println!: a console write racing with teardown must
