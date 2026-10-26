@@ -20,7 +20,7 @@ use windows::Win32::System::Console::{
 };
 use windows::core::PCWSTR;
 use shell_manager::protocol::{self, Request, Op};
-use shell_manager::session::{for_each_mouse_mode, mouse_bit};
+use shell_manager::session::{for_each_mouse_mode, mouse_bit, mouse_carry_tail};
 
 const USAGE: &str = "\
 usage: sm [name]          attach to <name>, creating it if needed
@@ -43,15 +43,25 @@ enum Cmd {
     Stop { name: Option<String> },
     List,
     Help,
+    Version,
 }
 
 fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
-    let wsl = args.iter().any(|a| a == "--wsl");
-    let words: Vec<&str> = args
-        .iter()
-        .filter(|a| !a.starts_with("--"))
-        .map(|s| s.as_str())
-        .collect();
+    let mut wsl = false;
+    let mut words: Vec<&str> = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.as_str() {
+            "--wsl" => wsl = true,
+            "-h" | "--help" => return Ok(Cmd::Help),
+            "-V" | "--version" => return Ok(Cmd::Version),
+            // A bare `help` is still handled as the first word below, so a
+            // session actually named "help" keeps working as an argument.
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option: {}", other));
+            }
+            other => words.push(other),
+        }
+    }
 
     let (first, rest) = match words.split_first() {
         Some((first, rest)) => (*first, rest),
@@ -90,6 +100,10 @@ fn main() -> Result<()> {
     match cmd {
         Cmd::Help => {
             println!("{}", USAGE);
+            Ok(())
+        }
+        Cmd::Version => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Cmd::List => {
@@ -203,6 +217,17 @@ fn attach_or_create(name: &str, wsl: bool) -> Result<()> {
 
     let started = request_sized(Op::Start, name, Some(wsl), cols, rows)?;
     if !started.ok {
+        // Two clients racing to create the same name: the loser sees "already
+        // exists" because the winner just created it. Attach to that session
+        // instead of failing.
+        if started.error.contains("already exists") {
+            let retried = request_sized(Op::Continue, name, None, cols, rows)?;
+            if retried.ok {
+                return attach_session(name, &retried);
+            }
+            eprintln!("attach failed: {}", retried.error);
+            std::process::exit(1);
+        }
         eprintln!("start failed: {}", started.error);
         std::process::exit(1);
     }
@@ -363,17 +388,23 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 
 /// Bumped whenever the client's input handling changes, so a stale attach is
 /// easy to spot in the banner.
-const CLIENT_BUILD: &str = "client 2026-10-26f";
+const CLIENT_BUILD: &str = "client 2026-10-26g";
 
 /// Appends a diagnostic line to %TEMP%\sm-client.log.
 ///
-/// Always on and best-effort: it records what the client actually received, so
-/// input problems can be diagnosed without reproducing them interactively.
+/// Always on and best-effort: it records events and byte counts, never key
+/// content, so passwords or API keys typed into the session cannot end up on
+/// disk. The tracked file size avoids a metadata() call on the key hot path.
 fn client_log(msg: &str) {
     use std::io::Write as _;
     use std::sync::{Mutex, OnceLock};
 
-    static LOG: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
+    struct Log {
+        file: Option<std::fs::File>,
+        size: u64,
+    }
+
+    static LOG: OnceLock<Mutex<Log>> = OnceLock::new();
     let slot = LOG.get_or_init(|| {
         let path = std::env::temp_dir().join("sm-client.log");
         let file = std::fs::OpenOptions::new()
@@ -381,32 +412,30 @@ fn client_log(msg: &str) {
             .append(true)
             .open(path)
             .ok();
-        Mutex::new(file)
+        let size = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Mutex::new(Log { file, size })
     });
     if let Ok(mut guard) = slot.lock() {
-        if let Some(file) = guard.as_mut() {
-            if file.metadata().map(|m| m.len() > 5_000_000).unwrap_or(false) {
+        let Log { file, size } = &mut *guard;
+        if let Some(file) = file.as_mut() {
+            if *size > 5_000_000 {
                 let _ = file.set_len(0);
+                *size = 0;
             }
             let ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            let _ = writeln!(file, "{} {}", ms, msg);
+            let line = format!("{} {}\n", ms, msg);
+            if file.write_all(line.as_bytes()).is_ok() {
+                *size += line.len() as u64;
+            }
         }
     }
-}
-
-fn hex_short(bytes: &[u8]) -> String {
-    let take = bytes.len().min(64);
-    let mut s = String::with_capacity(take * 3);
-    for b in &bytes[..take] {
-        s.push_str(&format!("{:02x} ", b));
-    }
-    if bytes.len() > take {
-        s.push_str("...");
-    }
-    s
 }
 
 /// Detach triggers. The printable sequence works from any keyboard and is not
@@ -732,28 +761,6 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     // here would scroll it and lose the bottom row. The client log records the
     // attach instead, and the detach notice carries the build id.
     let _ = write_all(stdout, b"");
-    // Start from a clean terminal state, then restore the mouse modes the
-    // hosted app had enabled before this client attached.
-    if has_console {
-        let _ = write_all(stdout, WIN32_INPUT_OFF);
-        let _ = write_all(stdout, MOUSE_RESET);
-        if initial_mouse_on {
-            let mut seq = Vec::new();
-            if mouse & 1 != 0 {
-                seq.extend_from_slice(b"\x1b[?1000h");
-            }
-            if mouse & 2 != 0 {
-                seq.extend_from_slice(b"\x1b[?1002h");
-            }
-            if mouse & 4 != 0 {
-                seq.extend_from_slice(b"\x1b[?1003h");
-            }
-            if mouse & 8 != 0 {
-                seq.extend_from_slice(b"\x1b[?1006h");
-            }
-            let _ = write_all(stdout, &seq);
-        }
-    }
 
     // Two unidirectional handles: out is read-only, in is write-only.
     // Byte-type pipes use byte read mode by default, so no SetNamedPipeHandleState
@@ -775,14 +782,14 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
     let mut raw_in_mode = CONSOLE_MODE(0);
     if has_console {
         // Raw input plus VT input, so arrows and function keys arrive as VT
-        // sequences. Mouse input stays enabled because the hosted TUI needs it;
-        // hover-only motion reports are filtered out below so they do not get
-        // typed into a plain shell prompt.
+        // sequences. Mouse input is enabled only when the hosted app had it on
+        // before this client attached; the reader thread switches it on and off
+        // as the app toggles its DEC modes. Hover-only motion reports are
+        // filtered out below so they do not get typed into a plain shell prompt.
         // ENABLE_EXTENDED_FLAGS is required for QUICK_EDIT_MODE to take effect.
         let raw_in = (orig_in_mode.0
             | ENABLE_EXTENDED_FLAGS.0
-            | ENABLE_VIRTUAL_TERMINAL_INPUT.0
-            | ENABLE_MOUSE_INPUT.0)
+            | ENABLE_VIRTUAL_TERMINAL_INPUT.0)
             & !(ENABLE_LINE_INPUT.0
                 | ENABLE_ECHO_INPUT.0
                 | ENABLE_PROCESSED_INPUT.0
@@ -800,7 +807,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
             | ENABLE_PROCESSED_OUTPUT.0
             | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0
             | DISABLE_NEWLINE_AUTO_RETURN.0;
-        unsafe {
+        let vt_out_ok = unsafe {
             if SetConsoleMode(stdin, initial_mode).is_err() {
                 // VT input unsupported on this console: fall back to plain raw mode.
                 let fallback = (orig_in_mode.0 | ENABLE_EXTENDED_FLAGS.0)
@@ -813,7 +820,31 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                 let _ = SetConsoleMode(stdin, CONSOLE_MODE(fallback));
             }
             // VT output is best-effort (older consoles may reject the flag).
-            let _ = SetConsoleMode(stdout, CONSOLE_MODE(raw_out));
+            SetConsoleMode(stdout, CONSOLE_MODE(raw_out)).is_ok()
+        };
+        if vt_out_ok {
+            // These are VT sequences: written before VT output was enabled they
+            // would show up as literal garbage on screen. Start from a clean
+            // terminal state, then restore the mouse modes the hosted app had
+            // enabled before this client attached.
+            let _ = write_all(stdout, WIN32_INPUT_OFF);
+            let _ = write_all(stdout, MOUSE_RESET);
+            if initial_mouse_on {
+                let mut seq = Vec::new();
+                if mouse & 1 != 0 {
+                    seq.extend_from_slice(b"\x1b[?1000h");
+                }
+                if mouse & 2 != 0 {
+                    seq.extend_from_slice(b"\x1b[?1002h");
+                }
+                if mouse & 4 != 0 {
+                    seq.extend_from_slice(b"\x1b[?1003h");
+                }
+                if mouse & 8 != 0 {
+                    seq.extend_from_slice(b"\x1b[?1006h");
+                }
+                let _ = write_all(stdout, &seq);
+            }
         }
     }
 
@@ -922,11 +953,9 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                     }
                     if !data.is_empty() {
                         client_log(&format!(
-                            "stdin read {}: {} | filtered {}: {}",
+                            "stdin read {} bytes, forwarding {} bytes",
                             read,
-                            hex_short(raw),
-                            data.len(),
-                            hex_short(data)
+                            data.len()
                         ));
                     }
                     let (forward, detach) = detector.feed(data);
@@ -1012,9 +1041,8 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8) -> Result<()> {
                                 }
                             }
                         });
-                        let keep = scan.len().min(16);
                         mouse_carry.clear();
-                        mouse_carry.extend_from_slice(&scan[scan.len() - keep..]);
+                        mouse_carry.extend_from_slice(mouse_carry_tail(&scan));
 
                         let now = mouse_state & 0b111 != 0;
                         if now != mouse_on {
@@ -1357,6 +1385,31 @@ mod cli_tests {
     #[test]
     fn help_is_recognised() {
         assert_eq!(parse(&args(&["-h"])).unwrap(), Cmd::Help);
+        assert_eq!(parse(&args(&["--help"])).unwrap(), Cmd::Help);
         assert_eq!(parse(&args(&["help"])).unwrap(), Cmd::Help);
+    }
+
+    #[test]
+    fn version_is_recognised() {
+        assert_eq!(parse(&args(&["-V"])).unwrap(), Cmd::Version);
+        assert_eq!(parse(&args(&["--version"])).unwrap(), Cmd::Version);
+    }
+
+    #[test]
+    fn unknown_option_is_rejected() {
+        let err = parse(&args(&["--bogus"])).unwrap_err();
+        assert!(err.contains("unknown option"), "unexpected error: {}", err);
+        assert!(parse(&args(&["t1", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn help_still_works_as_a_session_name_argument() {
+        assert_eq!(
+            parse(&args(&["a", "help"])).unwrap(),
+            Cmd::Attach {
+                name: Some("help".into()),
+                wsl: false
+            }
+        );
     }
 }
