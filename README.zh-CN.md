@@ -105,11 +105,11 @@ cargo build --release --bin smw
 前端有任何改动都要重新编译 `smw`，因为整个 `web/dist` 目录是在编译时内嵌的。
 
 以与 `smd` 相同的 Windows 用户启动桥接进程（`smw` 本身不要求交互桌面），然后
-打开 <http://127.0.0.1:8787>：
+打开 <http://127.0.0.1:27183>：
 
 ```text
 > smw
-smw 0.1.1 instance=prod listening on http://127.0.0.1:8787 (token off)
+smw 0.1.1 instance=prod listening on http://127.0.0.1:27183 (token off)
 ```
 
 选项：
@@ -118,7 +118,7 @@ smw 0.1.1 instance=prod listening on http://127.0.0.1:8787 (token off)
 smw [--bind <地址>] [--port <端口>] [--token <令牌>] [--instance <名字>]
     [--allow-insecure] [-h] [-V]
   --bind <地址>      监听地址（默认：127.0.0.1）
-  --port <端口>      监听端口（默认：8787）
+  --port <端口>      监听端口（默认：27183）
   --token <令牌>     API 令牌（默认取 $SMW_TOKEN；建议用环境变量）
   --instance <名字>  实例命名空间（覆盖 $SM_INSTANCE）
   --allow-insecure   允许非回环绑定且不设令牌（危险）
@@ -178,7 +178,7 @@ serverPort = 7000
 name = "smw"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = 8787
+localPort = 27183
 remotePort = 18787
 ```
 

@@ -15,7 +15,7 @@ const USAGE: &str = "\
 usage: smw [options]
 options:
   --bind <addr>       address to listen on (default: 127.0.0.1)
-  --port <port>       TCP port to listen on (default: 8787)
+  --port <port>       TCP port to listen on (default: 27183)
   --token <token>     API token (default: $SMW_TOKEN; never pass secrets in
                       shell history on a shared machine)
   --instance <name>   instance namespace (overrides $SM_INSTANCE)
@@ -29,7 +29,7 @@ environment:
                       when the executable runs under target/)";
 
 const DEFAULT_BIND: &str = "127.0.0.1";
-const DEFAULT_PORT: u16 = 8787;
+const DEFAULT_PORT: u16 = 27183;
 
 /// Settings resolved from the command line and the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,7 +293,7 @@ mod tests {
     fn defaults_are_local_only() {
         let raw = parse(&[]).unwrap();
         assert_eq!(raw.bind, "127.0.0.1");
-        assert_eq!(raw.port, 8787);
+        assert_eq!(raw.port, 27183);
         assert_eq!(raw.token, None);
         assert_eq!(raw.instance, None);
     }
@@ -353,9 +353,9 @@ mod tests {
 
     #[test]
     fn ipv6_listen_addresses_are_bracketed() {
-        assert_eq!(listen_address("127.0.0.1", 8787), "127.0.0.1:8787");
-        assert_eq!(listen_address("::1", 8787), "[::1]:8787");
-        assert_eq!(listen_address("[::1]", 8787), "[::1]:8787");
+        assert_eq!(listen_address("127.0.0.1", 27183), "127.0.0.1:27183");
+        assert_eq!(listen_address("::1", 27183), "[::1]:27183");
+        assert_eq!(listen_address("[::1]", 27183), "[::1]:27183");
     }
 
     #[test]

@@ -116,11 +116,11 @@ Rebuild `smw` after any frontend change, because the whole `web/dist` directory
 is embedded at compile time.
 
 Start the bridge under the same Windows user as `smd` - `smw` itself does not
-need the interactive desktop - then open <http://127.0.0.1:8787>:
+need the interactive desktop - then open <http://127.0.0.1:27183>:
 
 ```text
 > smw
-smw 0.1.1 instance=prod listening on http://127.0.0.1:8787 (token off)
+smw 0.1.1 instance=prod listening on http://127.0.0.1:27183 (token off)
 ```
 
 Options:
@@ -129,7 +129,7 @@ Options:
 smw [--bind <addr>] [--port <port>] [--token <token>] [--instance <name>]
     [--allow-insecure] [-h] [-V]
   --bind <addr>      address to listen on (default: 127.0.0.1)
-  --port <port>      TCP port to listen on (default: 8787)
+  --port <port>      TCP port to listen on (default: 27183)
   --token <token>    API token (default: $SMW_TOKEN; prefer the env var)
   --instance <name>  instance namespace (overrides $SM_INSTANCE)
   --allow-insecure   allow a non-loopback bind without a token (dangerous)
@@ -194,7 +194,7 @@ serverPort = 7000
 name = "smw"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = 8787
+localPort = 27183
 remotePort = 18787
 ```
 
