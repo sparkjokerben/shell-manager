@@ -54,13 +54,16 @@ cd shell-manager
 ## 用法
 
 ```text
-sm start <名字>            # 新建会话并附着
-sm start <名字> --wsl      # 托管 wsl.exe 而不是 PowerShell
-sm continue <名字>         # 重新附着一个已有会话
-sm list                    # 列出会话与附着状态
-sm detach <名字>           # 断开当前客户端，shell 保持运行
-sm stop <名字>             # 销毁会话及其 shell
+sm <名字>                  # 附着到该会话；不存在就新建
+sm                         # 回到最近用过的会话
+sm ls                      # 列出会话与附着状态
+sm detach [名字]           # 断开当前客户端，shell 保持运行
+sm stop [名字]             # 销毁会话及其 shell
+sm start <名字> --wsl      # 只新建（已存在则报错），托管 wsl.exe
 ```
+
+`a`/`attach`、`n`/`new`、`l`/`list`、`d`/`detach`、`k`/`kill` 都是缩写；`start`
+必须给名字，其余省略名字表示“最近用过的会话”。
 
 在附着的 shell 里按 `Ctrl+]` 或 `F12` 脱附，会话继续在后台运行；在另一个窗口里
 执行 `sm detach <名字>` 效果相同，且不受附着客户端当前状态影响。

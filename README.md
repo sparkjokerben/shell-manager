@@ -57,13 +57,17 @@ cd shell-manager
 ## Usage
 
 ```text
-sm start <name>            # create a session and attach to it
-sm start <name> --wsl      # host wsl.exe instead of PowerShell
-sm continue <name>         # reattach to an existing session
-sm list                    # sessions and their attach state
-sm detach <name>           # disconnect the attached client, keep the shell
-sm stop <name>             # destroy the session and its shell
+sm <name>                  # attach to <name>, creating it if it does not exist
+sm                         # back to the most recently used session
+sm ls                      # sessions and their attach state
+sm detach [name]           # disconnect the attached client, keep the shell
+sm stop [name]             # destroy the session and its shell
+sm start <name> --wsl      # create only (fails if it exists), hosting wsl.exe
 ```
+
+`a`/`attach`, `n`/`new`, `l`/`list`, `d`/`detach` and `k`/`kill` are accepted as
+short aliases; a name is required for `start` and optional everywhere else
+(omitted means the most recently used session).
 
 Detach from inside an attached shell with `Ctrl+]` or `F12`; the session keeps
 running in the background. `sm detach <name>` does the same from another window

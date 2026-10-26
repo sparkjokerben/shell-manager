@@ -22,71 +22,86 @@ use windows::core::PCWSTR;
 use shell_manager::protocol::{self, Request, Op};
 use shell_manager::session::{for_each_mouse_mode, mouse_bit};
 
+const USAGE: &str = "\
+usage: sm [name]          attach to <name>, creating it if needed
+       sm                 attach to the most recently used session
+       sm start <name>    create a session (fails if it exists)
+       sm detach [name]   disconnect the attached client, keep the shell
+       sm stop [name]     destroy the session and its shell
+       sm ls              list sessions
+options: --wsl  create the session with wsl.exe instead of PowerShell";
+
+/// What the command line asks for.
+#[derive(Debug, PartialEq)]
+enum Cmd {
+    /// Attach to the session, creating it when it does not exist. `None` means
+    /// "the most recently used session".
+    Attach { name: Option<String>, wsl: bool },
+    /// Create only; fails when the name is taken.
+    Start { name: String, wsl: bool },
+    Detach { name: Option<String> },
+    Stop { name: Option<String> },
+    List,
+    Help,
+}
+
+fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
+    let wsl = args.iter().any(|a| a == "--wsl");
+    let words: Vec<&str> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(|s| s.as_str())
+        .collect();
+
+    let (first, rest) = match words.split_first() {
+        Some((first, rest)) => (*first, rest),
+        None => return Ok(Cmd::Attach { name: None, wsl }),
+    };
+    let name = rest.first().map(|s| s.to_string());
+
+    Ok(match first {
+        "-h" | "help" => Cmd::Help,
+        "ls" | "l" | "list" => Cmd::List,
+        "a" | "attach" | "c" | "continue" => Cmd::Attach { name, wsl },
+        "n" | "new" | "start" => match name {
+            Some(name) => Cmd::Start { name, wsl },
+            None => return Err(USAGE.to_string()),
+        },
+        "d" | "detach" => Cmd::Detach { name },
+        "k" | "kill" | "rm" | "stop" => Cmd::Stop { name },
+        // Anything else is a session name.
+        other => Cmd::Attach {
+            name: Some(other.to_string()),
+            wsl,
+        },
+    })
+}
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: sm <start|continue|detach|list|stop> <name> [--wsl]");
-        std::process::exit(1);
-    }
-    match args[1].as_str() {
-        "start" => {
-            if args.len() < 3 {
-                eprintln!("usage: sm start <name> [--wsl]");
-                std::process::exit(1);
-            }
-            let name = args[2].clone();
-            let wsl = args.iter().any(|a| a == "--wsl");
-            let (cols, rows) = current_size();
-            let req = Request { op: Op::Start, name: name.clone(), wsl: Some(wsl), cols, rows };
-            let resp = protocol::pipe_request(protocol::CONTROL_PIPE, &req)?;
-            if !resp.ok {
-                eprintln!("start failed: {}", resp.error);
-                std::process::exit(1);
-            }
-            let (pipe_out, pipe_in, mouse) = extract_pipes(&resp.data);
-            attach(&name, &pipe_out, &pipe_in, mouse)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = match parse(&args) {
+        Ok(cmd) => cmd,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(1);
         }
-        "continue" => {
-            if args.len() < 3 {
-                eprintln!("usage: sm continue <name>");
-                std::process::exit(1);
-            }
-            let name = args[2].clone();
-            let (cols, rows) = current_size();
-            let req = Request { op: Op::Continue, name: name.clone(), wsl: None, cols, rows };
-            let resp = protocol::pipe_request(protocol::CONTROL_PIPE, &req)?;
-            if !resp.ok {
-                eprintln!("continue failed: {}", resp.error);
-                std::process::exit(1);
-            }
-            let (pipe_out, pipe_in, mouse) = extract_pipes(&resp.data);
-            attach(&name, &pipe_out, &pipe_in, mouse)
-        }
-        "detach" => {
-            if args.len() < 3 {
-                eprintln!("usage: sm detach <name>");
-                std::process::exit(1);
-            }
-            let name = args[2].clone();
-            let req = Request { op: Op::Detach, name, wsl: None, cols: None, rows: None };
-            let resp = protocol::pipe_request(protocol::CONTROL_PIPE, &req)?;
-            if resp.ok {
-                println!("detached");
-            } else {
-                eprintln!("detach failed: {}", resp.error);
-                std::process::exit(1);
-            }
+    };
+
+    match cmd {
+        Cmd::Help => {
+            println!("{}", USAGE);
             Ok(())
         }
-        "list" => {
-            let req = Request { op: Op::List, name: String::new(), wsl: None, cols: None, rows: None };
-            let resp = protocol::pipe_request(protocol::CONTROL_PIPE, &req)?;
+        Cmd::List => {
+            let resp = request(Op::List, "")?;
             if resp.ok {
                 if let Some(d) = resp.data {
-                    let arr = d.as_array().cloned().unwrap_or_default();
-                    for info in arr {
+                    for info in d.as_array().cloned().unwrap_or_default() {
                         let name = info.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                        let attached = info.get("attached").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let attached = info
+                            .get("attached")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         println!("{} {}", if attached { "*" } else { " " }, name);
                     }
                 }
@@ -95,27 +110,115 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        "stop" => {
-            if args.len() < 3 {
-                eprintln!("usage: sm stop <name>");
+        Cmd::Attach { name, wsl } => {
+            let name = resolve(name)?;
+            attach_or_create(&name, wsl)
+        }
+        Cmd::Start { name, wsl } => {
+            let (cols, rows) = current_size();
+            let resp = request_sized(Op::Start, &name, Some(wsl), cols, rows)?;
+            if !resp.ok {
+                eprintln!("start failed: {}", resp.error);
                 std::process::exit(1);
             }
-            let name = args[2].clone();
-            let req = Request { op: Op::Stop, name, wsl: None, cols: None, rows: None };
-            let resp = protocol::pipe_request(protocol::CONTROL_PIPE, &req)?;
-            if resp.ok {
-                println!("stopped");
-            } else {
-                eprintln!("stop failed: {}", resp.error);
-                std::process::exit(1);
-            }
+            attach_session(&name, &resp)
+        }
+        Cmd::Detach { name } => {
+            let name = resolve(name)?;
+            control(Op::Detach, &name, "detach")?;
+            println!("detached");
             Ok(())
         }
-        _ => {
-            eprintln!("unknown command: {}", args[1]);
-            std::process::exit(1);
+        Cmd::Stop { name } => {
+            let name = resolve(name)?;
+            control(Op::Stop, &name, "stop")?;
+            println!("stopped");
+            Ok(())
         }
     }
+}
+
+fn request(op: Op, name: &str) -> Result<protocol::Response> {
+    request_sized(op, name, None, None, None)
+}
+
+fn request_sized(
+    op: Op,
+    name: &str,
+    wsl: Option<bool>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> Result<protocol::Response> {
+    let req = Request {
+        op,
+        name: name.to_string(),
+        wsl,
+        cols,
+        rows,
+    };
+    protocol::pipe_request(protocol::CONTROL_PIPE, &req)
+}
+
+fn control(op: Op, name: &str, action: &str) -> Result<()> {
+    let resp = request(op, name)?;
+    if !resp.ok {
+        eprintln!("{} failed: {}", action, resp.error);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Name given on the command line, or the session used most recently.
+fn resolve(name: Option<String>) -> Result<String> {
+    if let Some(name) = name {
+        return Ok(name);
+    }
+    let resp = request(Op::Last, "")?;
+    if let Some(name) = resp
+        .data
+        .as_ref()
+        .and_then(|d| d.get("name"))
+        .and_then(|v| v.as_str())
+    {
+        return Ok(name.to_string());
+    }
+    eprintln!("no session yet; run `sm <name>`");
+    std::process::exit(1);
+}
+
+fn attach_or_create(name: &str, wsl: bool) -> Result<()> {
+    let (cols, rows) = current_size();
+    let resp = request_sized(Op::Continue, name, None, cols, rows)?;
+    if resp.ok {
+        return attach_session(name, &resp);
+    }
+
+    // A session that is gone (never existed, or its shell exited) is created on
+    // the fly; any other error is reported as-is.
+    let missing = resp.error.contains("not found") || resp.error.contains("has exited");
+    if !missing {
+        eprintln!("attach failed: {}", resp.error);
+        std::process::exit(1);
+    }
+
+    let started = request_sized(Op::Start, name, Some(wsl), cols, rows)?;
+    if !started.ok {
+        eprintln!("start failed: {}", started.error);
+        std::process::exit(1);
+    }
+    attach_session(name, &started)
+}
+
+fn attach_session(name: &str, resp: &protocol::Response) -> Result<()> {
+    let (pipe_out, pipe_in, mouse) = extract_pipes(&resp.data);
+    if let Err(e) = attach(name, &pipe_out, &pipe_in, mouse) {
+        eprintln!(
+            "attach failed: {:#}\nhint: if another window is attached to '{}', run `sm detach {}` there",
+            e, name, name
+        );
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn extract_pipes(data: &Option<serde_json::Value>) -> (String, String, u8) {
@@ -1158,5 +1261,102 @@ mod tests {
         let (head, tail) = seq.split_at(5);
         assert!(!d.feed(head));
         assert!(d.feed(tail));
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{parse, Cmd};
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bare_invocation_targets_the_last_session() {
+        assert_eq!(
+            parse(&[]).unwrap(),
+            Cmd::Attach {
+                name: None,
+                wsl: false
+            }
+        );
+    }
+
+    #[test]
+    fn name_alone_attaches_or_creates() {
+        assert_eq!(
+            parse(&args(&["t1"])).unwrap(),
+            Cmd::Attach {
+                name: Some("t1".into()),
+                wsl: false
+            }
+        );
+    }
+
+    #[test]
+    fn short_and_long_aliases_agree() {
+        for alias in ["ls", "l", "list"] {
+            assert_eq!(parse(&args(&[alias])).unwrap(), Cmd::List);
+        }
+        for alias in ["a", "attach", "c", "continue"] {
+            assert_eq!(
+                parse(&args(&[alias, "t1"])).unwrap(),
+                Cmd::Attach {
+                    name: Some("t1".into()),
+                    wsl: false
+                }
+            );
+        }
+        for alias in ["d", "detach"] {
+            assert_eq!(
+                parse(&args(&[alias])).unwrap(),
+                Cmd::Detach { name: None }
+            );
+        }
+        for alias in ["k", "kill", "rm", "stop"] {
+            assert_eq!(
+                parse(&args(&[alias, "t1"])).unwrap(),
+                Cmd::Stop {
+                    name: Some("t1".into())
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn start_creates_and_needs_a_name() {
+        assert_eq!(
+            parse(&args(&["start", "t1"])).unwrap(),
+            Cmd::Start {
+                name: "t1".into(),
+                wsl: false
+            }
+        );
+        assert!(parse(&args(&["start"])).is_err());
+    }
+
+    #[test]
+    fn wsl_flag_reaches_creation_paths() {
+        assert_eq!(
+            parse(&args(&["t1", "--wsl"])).unwrap(),
+            Cmd::Attach {
+                name: Some("t1".into()),
+                wsl: true
+            }
+        );
+        assert_eq!(
+            parse(&args(&["new", "t2", "--wsl"])).unwrap(),
+            Cmd::Start {
+                name: "t2".into(),
+                wsl: true
+            }
+        );
+    }
+
+    #[test]
+    fn help_is_recognised() {
+        assert_eq!(parse(&args(&["-h"])).unwrap(), Cmd::Help);
+        assert_eq!(parse(&args(&["help"])).unwrap(), Cmd::Help);
     }
 }

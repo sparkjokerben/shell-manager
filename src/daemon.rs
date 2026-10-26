@@ -19,8 +19,12 @@ use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 /// Shared session table: session name -> Session.
 type SessionTable = Arc<Mutex<HashMap<String, Session>>>;
 
+/// Session name used most recently, so bare `sm` can reattach without an argument.
+type LastSession = Arc<Mutex<Option<String>>>;
+
 pub struct Daemon {
     sessions: SessionTable,
+    last: LastSession,
     control_pipe: HANDLE,
 }
 
@@ -52,6 +56,7 @@ impl Daemon {
 
         Ok(Daemon {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            last: Arc::new(Mutex::new(None)),
             control_pipe: h,
         })
     }
@@ -69,14 +74,18 @@ impl Daemon {
                 continue;
             }
 
-            let _ = handle_control_connection(self.control_pipe, self.sessions.clone());
+            let _ = handle_control_connection(
+                self.control_pipe,
+                self.sessions.clone(),
+                self.last.clone(),
+            );
             unsafe { DisconnectNamedPipe(self.control_pipe) }.ok();
         }
     }
 }
 
 /// Handle one control-pipe connection: read one request, send one response, disconnect.
-fn handle_control_connection(pipe: HANDLE, sessions: SessionTable) -> Result<()> {
+fn handle_control_connection(pipe: HANDLE, sessions: SessionTable, last: LastSession) -> Result<()> {
     // Read length prefix (4 bytes LE).
     let mut len_buf = [0u8; 4];
     let mut read: u32 = 0;
@@ -108,7 +117,7 @@ fn handle_control_connection(pipe: HANDLE, sessions: SessionTable) -> Result<()>
     let req: Request = serde_json::from_slice(&req_buf)
         .context("failed to parse request JSON")?;
 
-    let response = dispatch(&req, &sessions);
+    let response = dispatch(&req, &sessions, &last);
 
     let payload = serde_json::to_vec(&response)?;
     let mut buf = Vec::with_capacity(4 + payload.len());
@@ -137,14 +146,23 @@ fn handle_control_connection(pipe: HANDLE, sessions: SessionTable) -> Result<()>
 }
 
 /// Dispatch a request to the appropriate session operation.
-fn dispatch(req: &Request, sessions: &SessionTable) -> Response {
+fn dispatch(req: &Request, sessions: &SessionTable, last: &LastSession) -> Response {
     match req.op {
-        Op::Start => handle_start(&req.name, req.wsl, req.cols, req.rows, sessions),
-        Op::Continue => handle_continue(&req.name, req.cols, req.rows, sessions),
+        Op::Start => handle_start(&req.name, req.wsl, req.cols, req.rows, sessions, last),
+        Op::Continue => handle_continue(&req.name, req.cols, req.rows, sessions, last),
         Op::List => handle_list(sessions),
-        Op::Stop => handle_stop(&req.name, sessions),
+        Op::Stop => handle_stop(&req.name, sessions, last),
         Op::Resize => handle_resize(&req.name, req.cols, req.rows, sessions),
         Op::Detach => handle_detach(&req.name, sessions),
+        Op::Last => handle_last(last),
+    }
+}
+
+/// Name of the most recently used session, for bare `sm`.
+fn handle_last(last: &LastSession) -> Response {
+    match last.lock().unwrap().clone() {
+        Some(name) => Response::ok(Some(serde_json::json!({ "name": name }))),
+        None => Response::err("no sessions yet"),
     }
 }
 
@@ -154,6 +172,7 @@ fn handle_start(
     cols: Option<u16>,
     rows: Option<u16>,
     sessions: &SessionTable,
+    last: &LastSession,
 ) -> Response {
     // A session whose shell exited is unusable; drop it before checking the name.
     let stale = {
@@ -212,6 +231,7 @@ fn handle_start(
                 return Response::err(format!("failed to start data pipe: {}", e));
             }
             table.insert(name.to_string(), session);
+            *last.lock().unwrap() = Some(name.to_string());
 
             let data = serde_json::json!({
                 "session_id": session_id,
@@ -235,6 +255,7 @@ fn handle_continue(
     cols: Option<u16>,
     rows: Option<u16>,
     sessions: &SessionTable,
+    last: &LastSession,
 ) -> Response {
     let mut table = sessions.lock().unwrap();
     let alive = match table.get(name) {
@@ -267,6 +288,7 @@ fn handle_continue(
     let session_id = session.session_id.clone();
     let (pipe_out, pipe_in) = session.data_pipe_paths();
     let mouse = session.mouse_state();
+    *last.lock().unwrap() = Some(name.to_string());
 
     let data = serde_json::json!({
         "session_id": session_id,
@@ -355,7 +377,7 @@ fn handle_detach(name: &str, sessions: &SessionTable) -> Response {
     Response::err(format!("session '{}' has exited", name))
 }
 
-fn handle_stop(name: &str, sessions: &SessionTable) -> Response {
+fn handle_stop(name: &str, sessions: &SessionTable, last: &LastSession) -> Response {
     // Release the table lock before stopping/dropping the session.
     let removed = {
         let mut table = sessions.lock().unwrap();
@@ -366,6 +388,10 @@ fn handle_stop(name: &str, sessions: &SessionTable) -> Response {
             return Response::err(format!("failed to stop session: {}", e));
         }
         drop(session);
+        let mut last = last.lock().unwrap();
+        if last.as_deref() == Some(name) {
+            *last = None;
+        }
         Response::ok(None)
     } else {
         Response::err(format!("session '{}' not found", name))

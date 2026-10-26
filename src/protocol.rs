@@ -16,6 +16,8 @@ pub enum Op {
     Stop,
     Resize,
     Detach,
+    /// Name of the session used most recently, for bare `sm` invocations.
+    Last,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,26 +83,46 @@ pub fn pipe_request(pipe: &str, req: &Request) -> anyhow::Result<Response> {
         ReadFile, WriteFile,
     };
     use windows::Win32::System::Pipes::{
-        PIPE_READMODE_BYTE, PIPE_WAIT, NAMED_PIPE_MODE, SetNamedPipeHandleState,
+        PIPE_READMODE_BYTE, PIPE_WAIT, NAMED_PIPE_MODE, SetNamedPipeHandleState, WaitNamedPipeW,
     };
     use windows::core::PCWSTR;
 
     let wide: Vec<u16> = std::ffi::OsStr::new(pipe).encode_wide().chain(Some(0)).collect();
-    let h = unsafe {
-        CreateFileW(
-            PCWSTR::from_raw(wide.as_ptr()),
-            GENERIC_READ.0 | GENERIC_WRITE.0,
-            FILE_SHARE_MODE(0),
-            None,
-            OPEN_EXISTING,
-            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-            None,
-        )
-    };
-    let h = match h {
-        Ok(h) => h,
-        Err(_) => {
-            anyhow::bail!("failed to connect to control pipe (is smd running?)");
+    // The daemon serves one connection at a time: between a response and the next
+    // ConnectNamedPipe the instance is briefly unavailable, and a client that
+    // sends two requests back to back (attach-or-create) would otherwise lose the
+    // second one with ERROR_PIPE_BUSY.
+    let mut attempts = 0;
+    let h = loop {
+        let h = unsafe {
+            CreateFileW(
+                PCWSTR::from_raw(wide.as_ptr()),
+                GENERIC_READ.0 | GENERIC_WRITE.0,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                None,
+            )
+        };
+        match h {
+            Ok(h) => break h,
+            Err(e) => {
+                let code = e.code().0 as u32;
+                // ERROR_PIPE_BUSY / ERROR_FILE_NOT_FOUND (the daemon is between
+                // DisconnectNamedPipe and ConnectNamedPipe, or still starting).
+                let retryable = code == 0x8007_00E7 || code == 0x8007_0002;
+                if !retryable || attempts >= 40 {
+                    anyhow::bail!("failed to connect to control pipe: {} (is smd running?)", e);
+                }
+                attempts += 1;
+                if code == 0x8007_00E7 {
+                    unsafe {
+                        let _ = WaitNamedPipeW(PCWSTR::from_raw(wide.as_ptr()), 250);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         }
     };
 
