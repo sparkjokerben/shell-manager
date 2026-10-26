@@ -798,34 +798,6 @@ fn spawn_writer(
     })
 }
 
-/// Ask the hosted app to redraw its whole screen after attaching.
-///
-/// Apps redraw when the console size changes, so shrink the pseudo console by
-/// one row and restore it. The pause between the two is essential: sent back to
-/// back, the app can see only the final size and skip the redraw, which leaves
-/// the last line of a TUI untouched.
-pub async fn force_repaint(
-    control: &ControlClient,
-    name: &str,
-    cols: u16,
-    rows: u16,
-    abort: &AtomicBool,
-) {
-    if rows < 2 {
-        let _ = control.resize(name, cols, rows.max(1)).await;
-        return;
-    }
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    if abort.load(Ordering::Acquire) {
-        return;
-    }
-    let _ = control.resize(name, cols, rows - 1).await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    if abort.load(Ordering::Acquire) {
-        return;
-    }
-    let _ = control.resize(name, cols, rows).await;
-}
 
 #[cfg(test)]
 mod tests {

@@ -307,13 +307,10 @@ async fn handle_socket(
         return;
     }
 
-    // A full repaint is a control request; never block the message loop on it.
-    let repaint_control = state.control.clone();
-    let repaint_name = name.clone();
-    let repaint_flag = takeover.clone();
-    tokio::spawn(async move {
-        bridge::force_repaint(&repaint_control, &repaint_name, cols, rows, &repaint_flag).await;
-    });
+    // Reattaching is repainted by the session itself (`needs_repaint` in
+    // session.rs). A second shrink/restore here would interleave with that one
+    // and with the browser's first resize request, making ConPTY reflow the
+    // screen while the user is already typing.
 
     let mut takeover_tick = tokio::time::interval(Duration::from_millis(200));
     takeover_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

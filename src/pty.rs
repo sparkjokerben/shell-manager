@@ -348,7 +348,15 @@ impl Pty {
     }
 
     /// Resize the pseudo console buffer.
+    ///
+    /// A no-op when the size is unchanged: ResizePseudoConsole makes ConPTY
+    /// reflow and repaint the hosted app, and duplicate resize requests (the
+    /// browser sends one after attaching, on top of the daemon's own) would
+    /// move the line the user is typing on.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        if self.cols == cols && self.rows == rows {
+            return Ok(());
+        }
         unsafe {
             windows::Win32::System::Console::ResizePseudoConsole(
                 self.hpc,
