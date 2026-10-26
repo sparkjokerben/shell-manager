@@ -60,7 +60,7 @@ Copy-Item "target\release\smw.exe" $smw -Force
 Write-Host "Web bridge deployed to $bin"
 Write-Host "If an smw instance is running, restart it to load the new embedded UI."
 Write-Host "smw is not started at logon. Start it manually, for example:"
-Write-Host "  smw --token <token>"
+Write-Host "  `$env:SMW_TOKEN = '<token>'; smw"
 Write-Host "then open http://127.0.0.1:8787 (the default bind address)."
 
 # Hidden launcher used by the logon task; it also pins the daemon's working
