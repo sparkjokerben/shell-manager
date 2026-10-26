@@ -222,11 +222,17 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
     anyhow::bail!("timed out connecting to data pipe {}", name)
 }
 
-const DETACH_KEY: u8 = 0x1d;
+/// Bytes that detach the client.
+///
+/// Ctrl+G (BEL) is the primary key: control-letter chords are encoded as
+/// 0x01-0x1A by every Windows console and terminal, unlike punctuation chords
+/// such as Ctrl+] (0x1D), which some terminals never send. Ctrl+] is kept for
+/// terminals that do deliver it.
+const DETACH_KEYS: &[u8] = &[0x07, 0x1d];
 
-/// Position of the Ctrl+] detach key in a read, if present.
+/// Position of a detach key in a read, if present.
 fn detach_key_pos(data: &[u8]) -> Option<usize> {
-    data.iter().position(|&b| b == DETACH_KEY)
+    data.iter().position(|b| DETACH_KEYS.contains(b))
 }
 
 /// Wait (bounded) for the reader thread to publish its thread id, then cancel
@@ -320,7 +326,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
 
     // Print before connecting: once connected, the daemon starts streaming PTY
     // output, and mixing console-wide prints with raw byte writes garbles the line.
-    println!("\r\nattached (detach: Ctrl+] or ~. at line start)");
+    println!("\r\nattached (detach: Ctrl+G, or Ctrl+] / ~. at line start)");
 
     // Two unidirectional handles: out is read-only, in is write-only.
     // Byte-type pipes use byte read mode by default, so no SetNamedPipeHandleState
@@ -562,6 +568,12 @@ mod tests {
     #[test]
     fn detach_key_after_bytes() {
         assert_eq!(detach_key_pos(b"abcd\x1d"), Some(4));
+    }
+
+    #[test]
+    fn ctrl_g_detaches() {
+        assert_eq!(detach_key_pos(b"\x07"), Some(0));
+        assert_eq!(detach_key_pos(b"abc\x07def"), Some(3));
     }
 
     #[test]
