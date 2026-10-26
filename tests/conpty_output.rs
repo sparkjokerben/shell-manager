@@ -12,7 +12,7 @@ fn conpty_forwards_truecolor_and_sync_output() {
     std::fs::write(&file, payload).unwrap();
 
     let mut pty = Pty::new(80, 25).unwrap();
-    pty.spawn(&format!("cmd.exe /c type {}", file.display())).unwrap();
+    pty.spawn(&format!("cmd.exe /c type \"{}\"", file.display())).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut out: Vec<u8> = Vec::new();
