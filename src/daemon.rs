@@ -162,7 +162,7 @@ fn handle_start(name: &str, wsl: Option<bool>, sessions: &SessionTable) -> Respo
     match Session::new(name, 120, 40, &cmd) {
         Ok(session) => {
             let session_id = session.session_id.clone();
-            let pipe_name = session.data_pipe_path();
+            let (pipe_out, pipe_in) = session.data_pipe_paths();
             if let Err(e) = session.start_data_pipe_listener() {
                 return Response::err(format!("failed to start data pipe: {}", e));
             }
@@ -170,7 +170,8 @@ fn handle_start(name: &str, wsl: Option<bool>, sessions: &SessionTable) -> Respo
 
             let data = serde_json::json!({
                 "session_id": session_id,
-                "pipe_name": pipe_name,
+                "pipe_out": pipe_out,
+                "pipe_in": pipe_in,
             });
             Response::ok(Some(data))
         }
@@ -196,11 +197,12 @@ fn handle_continue(name: &str, sessions: &SessionTable) -> Response {
     }
 
     let session_id = session.session_id.clone();
-    let pipe_name = session.data_pipe_path();
+    let (pipe_out, pipe_in) = session.data_pipe_paths();
 
     let data = serde_json::json!({
         "session_id": session_id,
-        "pipe_name": pipe_name,
+        "pipe_out": pipe_out,
+        "pipe_in": pipe_in,
     });
     Response::ok(Some(data))
 }
@@ -226,11 +228,16 @@ fn handle_list(sessions: &SessionTable) -> Response {
 }
 
 fn handle_stop(name: &str, sessions: &SessionTable) -> Response {
-    let mut table = sessions.lock().unwrap();
-    if let Some(session) = table.remove(name) {
+    // Release the table lock before stopping/dropping the session.
+    let removed = {
+        let mut table = sessions.lock().unwrap();
+        table.remove(name)
+    };
+    if let Some(session) = removed {
         if let Err(e) = session.stop() {
             return Response::err(format!("failed to stop session: {}", e));
         }
+        drop(session);
         Response::ok(None)
     } else {
         Response::err(format!("session '{}' not found", name))

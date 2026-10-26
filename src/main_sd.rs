@@ -1,11 +1,10 @@
 use std::os::windows::ffi::OsStrExt;
 use std::ffi::OsStr;
 use anyhow::Result;
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
-use windows::Win32::Storage::FileSystem::FILE_SHARE_MODE;
+use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, OPEN_EXISTING, SECURITY_SQOS_PRESENT, SECURITY_IDENTIFICATION,
-    ReadFile, WriteFile,
+    CreateFileW, FILE_SHARE_MODE, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+    SECURITY_SQOS_PRESENT, ReadFile, WriteFile,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -13,9 +12,8 @@ use windows::Win32::System::Console::{
     ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT, ENABLE_MOUSE_INPUT,
     ENABLE_PROCESSED_OUTPUT, ENABLE_WRAP_AT_EOL_OUTPUT, CONSOLE_MODE,
 };
-use windows::Win32::System::Pipes::{PIPE_READMODE_BYTE, PIPE_WAIT, NAMED_PIPE_MODE, SetNamedPipeHandleState};
-use shell_daemon::protocol::{self, Request, Op};
 use windows::core::PCWSTR;
+use shell_daemon::protocol::{self, Request, Op};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -37,11 +35,8 @@ fn main() -> Result<()> {
                 eprintln!("start failed: {}", resp.error);
                 std::process::exit(1);
             }
-            let pipe_name = resp
-                .data
-                .and_then(|d| d.get("pipe_name").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                .unwrap_or_default();
-            attach(&pipe_name)
+            let (pipe_out, pipe_in) = extract_pipes(&resp.data);
+            attach(&pipe_out, &pipe_in)
         }
         "continue" => {
             if args.len() < 3 {
@@ -55,11 +50,8 @@ fn main() -> Result<()> {
                 eprintln!("continue failed: {}", resp.error);
                 std::process::exit(1);
             }
-            let pipe_name = resp
-                .data
-                .and_then(|d| d.get("pipe_name").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                .unwrap_or_default();
-            attach(&pipe_name)
+            let (pipe_out, pipe_in) = extract_pipes(&resp.data);
+            attach(&pipe_out, &pipe_in)
         }
         "list" => {
             let req = Request { op: Op::List, name: String::new(), wsl: None };
@@ -101,28 +93,52 @@ fn main() -> Result<()> {
     }
 }
 
-fn attach(pipe_name: &str) -> Result<()> {
-    let wide: Vec<u16> = OsStrExt::encode_wide(OsStr::new(pipe_name)).chain(Some(0)).collect();
-    let h = match unsafe {
+fn extract_pipes(data: &Option<serde_json::Value>) -> (String, String) {
+    let out = data
+        .as_ref()
+        .and_then(|d| d.get("pipe_out"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let inp = data
+        .as_ref()
+        .and_then(|d| d.get("pipe_in"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    (out, inp)
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(Some(0)).collect()
+}
+
+/// Open one end of a session pipe with the required access.
+fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
+    let w = wide(name);
+    let h = unsafe {
         CreateFileW(
-            PCWSTR::from_raw(wide.as_ptr()),
-            GENERIC_READ.0 | GENERIC_WRITE.0,
+            PCWSTR::from_raw(w.as_ptr()),
+            access,
             FILE_SHARE_MODE(0),
             None,
             OPEN_EXISTING,
             SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
             None,
         )
-    } {
-        Ok(h) => h,
-        Err(_) => {
-            anyhow::bail!("failed to connect to data pipe (is the session attached?)");
-        }
     };
-    unsafe {
-        let mut mode: NAMED_PIPE_MODE = PIPE_READMODE_BYTE | PIPE_WAIT;
-        SetNamedPipeHandleState(h, Some(&mut mode), None, None)?;
+    match h {
+        Ok(h) => Ok(h),
+        Err(_) => anyhow::bail!("failed to connect to data pipe {}", name),
     }
+}
+
+fn attach(pipe_out: &str, pipe_in: &str) -> Result<()> {
+    // Two unidirectional handles: out is read-only, in is write-only.
+    // Byte-type pipes use byte read mode by default, so no SetNamedPipeHandleState
+    // is needed (it would require extra access rights on a read-only handle).
+    let h_out = open_pipe(pipe_out, GENERIC_READ.0)?;
+    let h_in = open_pipe(pipe_in, GENERIC_WRITE.0)?;
 
     // Put the local console into raw mode so input passes through byte-for-byte.
     // If stdin/stdout are not real consoles (e.g. piped), skip raw mode but keep forwarding.
@@ -175,10 +191,11 @@ fn attach(pipe_name: &str) -> Result<()> {
         out_mode: orig_out_mode,
     };
 
-    println!("\r\nattached to {} (escape: ~.)", pipe_name);
+    println!("\r\nattached to {} (escape: ~.)", pipe_out);
 
-    let h_stdin_thread = h.clone();
-    let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE)? };
+    // The main thread will block reading the out pipe. Remember its id so the
+    // stdin thread can cancel that read when the user detaches with "~.".
+    let main_tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
 
     let stdin_thread = std::thread::spawn(move || -> Result<()> {
         let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
@@ -199,6 +216,15 @@ fn attach(pipe_name: &str) -> Result<()> {
                     let data = &buf[..read as usize];
                     // Detach sequence: "~." optionally followed by CR/LF.
                     if data == b"~.\r" || data == b"~.\n" || data == b"~." {
+                        // Unblock the main thread's ReadFile on the out pipe.
+                        unsafe {
+                            use windows::Win32::System::IO::CancelSynchronousIo;
+                            use windows::Win32::System::Threading::{OpenThread, THREAD_TERMINATE};
+                            if let Ok(ht) = OpenThread(THREAD_TERMINATE, false, main_tid) {
+                                let _ = CancelSynchronousIo(ht);
+                                let _ = windows::Win32::Foundation::CloseHandle(ht);
+                            }
+                        }
                         break;
                     }
                     let mut pos = 0;
@@ -206,7 +232,7 @@ fn attach(pipe_name: &str) -> Result<()> {
                         let mut written: u32 = 0;
                         let r2 = unsafe {
                             WriteFile(
-                                h_stdin_thread,
+                                h_in,
                                 Some(&data[pos..]),
                                 Some(&mut written),
                                 None,
@@ -225,13 +251,13 @@ fn attach(pipe_name: &str) -> Result<()> {
         Ok(())
     });
 
-    // Main thread: pipe -> stdout.
+    // Main thread: out pipe -> stdout.
     let mut buf = [0u8; 4096];
     loop {
         let mut read: u32 = 0;
         let r = unsafe {
             ReadFile(
-                h,
+                h_out,
                 Some(&mut buf),
                 Some(&mut read),
                 None,
@@ -245,7 +271,7 @@ fn attach(pipe_name: &str) -> Result<()> {
                     let mut written: u32 = 0;
                     let r2 = unsafe {
                         WriteFile(
-                            stdout_handle,
+                            stdout,
                             Some(&buf[pos..read as usize]),
                             Some(&mut written),
                             None,
@@ -262,10 +288,9 @@ fn attach(pipe_name: &str) -> Result<()> {
         }
     }
 
-    let _ = stdin_thread.join();
-    unsafe {
-        let _ = CloseHandle(h);
-    }
+    // Do NOT join the stdin thread: in raw mode it may be blocked in a console
+    // read that never returns. Returning from main terminates the process.
+    drop(stdin_thread);
     println!("\r\ndetached");
     Ok(())
 }

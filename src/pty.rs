@@ -113,13 +113,15 @@ impl Pty {
             )
             .ok();
 
+            // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE takes the HPCON value itself
+            // (not a pointer to it); pass the handle value as lpValue.
             let hpc_val: *const c_void = self.hpc.0 as *const c_void;
             let result = UpdateProcThreadAttribute(
                 attr_list_ptr,
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                Some(&hpc_val as *const *const c_void as *const c_void),
-                mem::size_of::<*const c_void>(),
+                Some(hpc_val),
+                mem::size_of::<HPCON>(),
                 None,
                 None,
             );
@@ -215,6 +217,17 @@ impl Pty {
             .context("PeekNamedPipe on PTY output failed")?;
         }
         Ok(avail)
+    }
+
+    /// Whether the child shell process is still running.
+    pub fn is_running(&self) -> bool {
+        match &self.process {
+            Some(pi) => unsafe {
+                windows::Win32::System::Threading::WaitForSingleObject(pi.hProcess, 0)
+                    == windows::Win32::Foundation::WAIT_TIMEOUT
+            },
+            None => false,
+        }
     }
 
     /// Child process ID.
