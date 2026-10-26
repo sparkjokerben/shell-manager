@@ -13,7 +13,7 @@ use windows::Win32::System::Console::{
     GetConsoleMode, SetConsoleMode,
     GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO,
     GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
-    ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT, ENABLE_MOUSE_INPUT,
+    ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_WINDOW_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, CONSOLE_MODE,
     ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
     ENABLE_PROCESSED_OUTPUT, DISABLE_NEWLINE_AUTO_RETURN,
@@ -222,18 +222,17 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
     anyhow::bail!("timed out connecting to data pipe {}", name)
 }
 
-/// Bytes that detach the client.
-///
-/// Ctrl+G (BEL) is the primary key: control-letter chords are encoded as
-/// 0x01-0x1A by every Windows console and terminal, unlike punctuation chords
-/// such as Ctrl+] (0x1D), which some terminals never send. Ctrl+] is kept for
-/// terminals that do deliver it.
-const DETACH_KEYS: &[u8] = &[0x07, 0x1d];
+/// F12, the detach key: terminals send the standard xterm sequence, ssh does
+/// not consume it, and Claude Code does not bind it.
+const F12_SEQ: &[u8] = b"\x1b[24~";
 
-/// Position of a detach key in a read, if present.
-fn detach_key_pos(data: &[u8]) -> Option<usize> {
-    data.iter().position(|b| DETACH_KEYS.contains(b))
-}
+/// Ctrl+] (0x1D), kept for terminals that do send punctuation chords.
+const CTRL_BRACKET_RIGHT: u8 = 0x1d;
+
+/// Disable terminal mouse reporting. A TUI that exits without restoring its
+/// mouse mode otherwise leaves the terminal sending SGR mouse reports, which
+/// leak into the shell as typed garbage.
+const MOUSE_RESET: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
 /// Wait (bounded) for the reader thread to publish its thread id, then cancel
 /// its blocking read until it reports done.
@@ -264,41 +263,54 @@ fn stop_reader(reader_tid: &AtomicU32, reader_done: &AtomicBool) {
     }
 }
 
-/// Detects the "~." detach sequence at the start of a line, like ssh.
-///
-/// A "~" typed at line start is held back until the next byte arrives, so a
-/// sequence split across two reads is still recognized.
+/// Detects a detach key in the input stream, tolerating a sequence split
+/// across reads.
 struct DetachDetector {
-    held_tilde: bool,
-    line_start: bool,
+    pending: Vec<u8>,
 }
 
 impl DetachDetector {
     fn new() -> Self {
-        Self { held_tilde: false, line_start: true }
+        Self { pending: Vec::new() }
     }
 
     /// Returns the bytes to forward and whether detach was requested.
     fn feed(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
-        let mut out = Vec::with_capacity(data.len() + 1);
-        for &b in data {
-            if self.held_tilde {
-                self.held_tilde = false;
-                if b == b'.' {
-                    return (out, true);
-                }
-                out.push(b'~');
-                self.line_start = false;
-            }
-            if self.line_start && b == b'~' {
-                self.held_tilde = true;
-                continue;
-            }
-            out.push(b);
-            self.line_start = b == b'\r' || b == b'\n';
+        self.pending.extend_from_slice(data);
+
+        if let Some(pos) = self.pending.iter().position(|&b| b == CTRL_BRACKET_RIGHT) {
+            let forward = self.pending[..pos].to_vec();
+            self.pending.clear();
+            return (forward, true);
         }
-        (out, false)
+        if let Some(pos) = find_subslice(&self.pending, F12_SEQ) {
+            let forward = self.pending[..pos].to_vec();
+            self.pending.clear();
+            return (forward, true);
+        }
+
+        // Hold back a trailing partial F12 sequence so a split key is still seen.
+        let keep = partial_suffix(&self.pending, F12_SEQ);
+        let split = self.pending.len() - keep;
+        let forward = self.pending[..split].to_vec();
+        self.pending.drain(..split);
+        (forward, false)
     }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Length of the longest suffix of `data` that is a prefix of `needle`.
+fn partial_suffix(data: &[u8], needle: &[u8]) -> usize {
+    let max = data.len().min(needle.len() - 1);
+    (1..=max)
+        .rev()
+        .find(|&k| data.ends_with(&needle[..k]))
+        .unwrap_or(0)
 }
 
 fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
@@ -326,7 +338,12 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
 
     // Print before connecting: once connected, the daemon starts streaming PTY
     // output, and mixing console-wide prints with raw byte writes garbles the line.
-    println!("\r\nattached (detach: Ctrl+G, or Ctrl+] / ~. at line start)");
+    println!("\r\nattached (detach: F12)");
+    // Start from a clean terminal state: a previous TUI may have left mouse
+    // reporting enabled.
+    if has_console {
+        let _ = write_all(stdout, MOUSE_RESET);
+    }
 
     // Two unidirectional handles: out is read-only, in is write-only.
     // Byte-type pipes use byte read mode by default, so no SetNamedPipeHandleState
@@ -336,13 +353,14 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
 
     // Put the local console into raw mode so input passes through byte-for-byte.
     if has_console {
-        // Raw input, plus VT input so arrows / function keys / mouse arrive as VT
-        // sequences instead of being dropped by the console input translator.
+        // Raw input plus VT input, so arrows and function keys (including the
+        // F12 detach key) arrive as VT sequences. Do NOT enable
+        // ENABLE_MOUSE_INPUT: in VT input mode conhost then asks the outer
+        // terminal for all mouse events, and stray reports leak into the shell.
         // ENABLE_EXTENDED_FLAGS is required for QUICK_EDIT_MODE to take effect.
         let raw_in = (orig_in_mode.0
             | ENABLE_EXTENDED_FLAGS.0
-            | ENABLE_VIRTUAL_TERMINAL_INPUT.0
-            | ENABLE_MOUSE_INPUT.0)
+            | ENABLE_VIRTUAL_TERMINAL_INPUT.0)
             & !(ENABLE_LINE_INPUT.0
                 | ENABLE_ECHO_INPUT.0
                 | ENABLE_PROCESSED_INPUT.0
@@ -454,19 +472,10 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
                 Ok(()) if read == 0 => break,
                 Ok(()) => {
                     let data = &buf[..read as usize];
-                    if let Some(pos) = detach_key_pos(data) {
-                        // Forward whatever preceded the key on this read, then
-                        // tear the connection down.
-                        if pos > 0 {
-                            let _ = write_all(h_in, &data[..pos]);
-                        }
-                        stop_reader(&stdin_reader_tid, &stdin_done);
-                        break;
-                    }
                     let (forward, detach) = detector.feed(data);
                     if detach {
-                        // Forward whatever preceded the escape on this read
-                        // before tearing the connection down (ssh-like).
+                        // Forward whatever preceded the key on this read before
+                        // tearing the connection down.
                         if !forward.is_empty() {
                             let _ = write_all(h_in, &forward);
                         }
@@ -545,6 +554,11 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
     // Do NOT join the stdin thread: in raw mode it may be blocked in a console
     // read that never returns. Returning from main terminates the process.
     drop(stdin_thread);
+    // Leave the terminal clean: disable mouse reporting the hosted TUI may have
+    // enabled, so stray reports do not get typed into the shell after detach.
+    if has_console {
+        let _ = write_all(stdout, MOUSE_RESET);
+    }
     // Plain write instead of println!: a console write racing with teardown must
     // not panic the client with "failed printing to stdout".
     let _ = write_all(stdout, b"\r\ndetached\r\n");
@@ -553,57 +567,68 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{detach_key_pos, DetachDetector};
+    use super::DetachDetector;
 
     #[test]
-    fn detach_key_absent() {
-        assert_eq!(detach_key_pos(b"hello\r\n"), None);
-    }
-
-    #[test]
-    fn detach_key_at_start() {
-        assert_eq!(detach_key_pos(b"\x1drest"), Some(0));
-    }
-
-    #[test]
-    fn detach_key_after_bytes() {
-        assert_eq!(detach_key_pos(b"abcd\x1d"), Some(4));
-    }
-
-    #[test]
-    fn ctrl_g_detaches() {
-        assert_eq!(detach_key_pos(b"\x07"), Some(0));
-        assert_eq!(detach_key_pos(b"abc\x07def"), Some(3));
-    }
-
-    #[test]
-    fn detach_sequence_split_across_reads() {
+    fn f12_detaches() {
         let mut d = DetachDetector::new();
-        assert_eq!(d.feed(b"~"), (Vec::new(), false));
-        assert_eq!(d.feed(b"."), (Vec::new(), true));
+        let (out, detach) = d.feed(b"\x1b[24~");
+        assert!(detach);
+        assert!(out.is_empty());
     }
 
     #[test]
-    fn tilde_inside_a_line_is_forwarded_unchanged() {
+    fn f12_after_text_forwards_the_prefix() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"abc\x1b[24~");
+        assert!(detach);
+        assert_eq!(&out[..], b"abc");
+    }
+
+    #[test]
+    fn f12_split_across_reads() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"ab\x1b[2");
+        assert!(!detach);
+        assert_eq!(&out[..], b"ab");
+        let (out, detach) = d.feed(b"4~");
+        assert!(detach);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn ctrl_bracket_right_still_detaches() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"xy\x1d");
+        assert!(detach);
+        assert_eq!(&out[..], b"xy");
+    }
+
+    #[test]
+    fn other_escape_sequences_are_forwarded() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"\x1b[A\x1b[24");
+        assert!(!detach);
+        // The trailing partial F12 prefix is held for the next read.
+        assert_eq!(&out[..], b"\x1b[A");
+        let (out, detach) = d.feed(b"~");
+        assert!(detach);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn modified_f12_is_forwarded() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"\x1b[24;2~");
+        assert!(!detach);
+        assert_eq!(&out[..], b"\x1b[24;2~");
+    }
+
+    #[test]
+    fn plain_text_is_forwarded_unchanged() {
         let mut d = DetachDetector::new();
         let (out, detach) = d.feed(b"cd ~/x\r");
         assert!(!detach);
-        assert_eq!(&out[..], &b"cd ~/x\r"[..]);
-    }
-
-    #[test]
-    fn tilde_at_line_start_followed_by_other_char() {
-        let mut d = DetachDetector::new();
-        let (out, detach) = d.feed(b"~a");
-        assert!(!detach);
-        assert_eq!(&out[..], &b"~a"[..]);
-    }
-
-    #[test]
-    fn detach_only_at_line_start() {
-        let mut d = DetachDetector::new();
-        let (out, detach) = d.feed(b"x~.");
-        assert!(!detach);
-        assert_eq!(&out[..], &b"x~."[..]);
+        assert_eq!(&out[..], b"cd ~/x\r");
     }
 }
