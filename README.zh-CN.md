@@ -4,6 +4,10 @@
 
 [English](README.md)
 
+[![ci](https://github.com/sparkjokerben/shell-persistence/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkjokerben/shell-persistence/actions/workflows/ci.yml)
+[![release](https://github.com/sparkjokerben/shell-persistence/actions/workflows/release.yml/badge.svg)](https://github.com/sparkjokerben/shell-persistence/releases)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 `sp` 是你敲命令的客户端，`spd` 是常驻后台的小守护进程。守护进程持有一个由
 Windows 伪终端（ConPTY）托管的 shell：关掉 SSH 窗口、网络断开，或者主动脱附，
 shell 都继续跑；重新连上后 `sp continue <名字>` 就回到同一个 shell，回滚缓冲、

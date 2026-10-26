@@ -4,6 +4,10 @@ Persistent Windows shells that survive SSH disconnects.
 
 [中文说明](README.zh-CN.md)
 
+[![ci](https://github.com/sparkjokerben/shell-persistence/actions/workflows/ci.yml/badge.svg)](https://github.com/sparkjokerben/shell-persistence/actions/workflows/ci.yml)
+[![release](https://github.com/sparkjokerben/shell-persistence/actions/workflows/release.yml/badge.svg)](https://github.com/sparkjokerben/shell-persistence/releases)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 `sp` is the client you type into; `spd` is a small background daemon. The daemon
 owns a shell hosted in a Windows pseudo console (ConPTY). Close the SSH window,
 lose the connection, or detach on purpose - the shell keeps running. Reconnect
