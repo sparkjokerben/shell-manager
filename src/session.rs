@@ -8,16 +8,19 @@
 //! `ReadFile` against a `WriteFile` on the same synchronous (non-overlapped)
 //! pipe handle.
 
+use crate::protocol::DATA_PIPE_PREFIX;
 use crate::pty::Pty;
 use anyhow::Result;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
+};
 use windows::Win32::Storage::FileSystem::{
     PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
 };
@@ -28,8 +31,7 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{COORD, ResizePseudoConsole};
-
-const DATA_PIPE_PREFIX: &str = r"\\.\pipe\shell-manager\data";
+use windows::Win32::System::Threading::GetCurrentProcess;
 
 /// State of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,15 @@ pub struct Session {
     /// Win32 thread ids of the out/in threads (for cancelling blocking I/O).
     pub out_tid: Arc<Mutex<Option<u32>>>,
     pub in_tid: Arc<Mutex<Option<u32>>>,
+    /// Set when the corresponding listener thread has exited. Used by `stop`
+    /// to keep cancelling until both threads are really gone.
+    pub out_done: Arc<AtomicBool>,
+    pub in_done: Arc<AtomicBool>,
+    /// Connection generation per direction, bumped after `ConnectNamedPipe`
+    /// succeeds. A pending detach helper stops once either counter moves, so a
+    /// quick reattach is not hit by cancellations meant for the old client.
+    pub out_gen: Arc<AtomicU32>,
+    pub in_gen: Arc<AtomicU32>,
 }
 
 impl Session {
@@ -79,6 +90,10 @@ impl Session {
             mouse_modes: Arc::new(AtomicU8::new(0)),
             out_tid: Arc::new(Mutex::new(None)),
             in_tid: Arc::new(Mutex::new(None)),
+            out_done: Arc::new(AtomicBool::new(false)),
+            in_done: Arc::new(AtomicBool::new(false)),
+            out_gen: Arc::new(AtomicU32::new(0)),
+            in_gen: Arc::new(AtomicU32::new(0)),
         })
     }
 
@@ -99,8 +114,36 @@ impl Session {
         // in: client -> daemon (server reads).
         let in_h = create_pipe(&in_path, PIPE_ACCESS_INBOUND)?;
 
+        // The input thread writes through a private duplicate of the PTY input
+        // handle instead of holding the pty mutex: `WriteFile` can block while
+        // the console drains, and the out/drain threads need that mutex to read
+        // output. The duplicate stays valid after the Pty is dropped and closes
+        // its own handle.
+        let input_write = {
+            let p = self.pty.lock().unwrap();
+            let mut dup = HANDLE::default();
+            let result = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    p.input_write,
+                    GetCurrentProcess(),
+                    &mut dup,
+                    0,
+                    false,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if let Err(e) = result {
+                unsafe {
+                    let _ = CloseHandle(out_h);
+                    let _ = CloseHandle(in_h);
+                }
+                return Err(e.into());
+            }
+            dup
+        };
+
         let pty_out = self.pty.clone();
-        let pty_in = self.pty.clone();
         let state_out = self.state.clone();
         let state_in = self.state.clone();
         let stop_out = self.stop_flag.clone();
@@ -115,21 +158,32 @@ impl Session {
         let repaint_in = self.needs_repaint.clone();
         let mouse_out = self.mouse_modes.clone();
         let mouse_drain = self.mouse_modes.clone();
+        let out_gen = self.out_gen.clone();
+        let in_gen = self.in_gen.clone();
+        let out_done = self.out_done.clone();
+        let in_done = self.in_done.clone();
 
         // In thread (client -> PTY).
         let in_tid_slot = in_tid.clone();
         let stop_in_thread = stop_in.clone();
+        let in_gen_thread = in_gen.clone();
         thread::spawn(move || {
+            let _done = DoneOnDrop(in_done);
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             *in_tid_slot.lock().unwrap() = Some(tid);
-            run_in_thread(in_h, pty_in, state_in, stop_in_thread, alive_in, detach_in, repaint_in);
+            run_in_thread(
+                in_h, input_write, state_in, stop_in_thread, alive_in, detach_in, repaint_in,
+                in_gen_thread,
+            );
         });
 
         // Out thread (PTY -> client).
+        let out_gen_thread = out_gen.clone();
         thread::spawn(move || {
+            let _done = DoneOnDrop(out_done);
             let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
             *out_tid.lock().unwrap() = Some(tid);
-            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out, repaint_out, mouse_out);
+            run_out_thread(out_h, pty_out, state_out, stop_out, alive_out, detach_out, repaint_out, mouse_out, out_gen_thread);
         });
 
         // Drain thread (PTY -> discard while no client is attached).
@@ -160,12 +214,34 @@ impl Session {
     pub fn stop(&self) -> Result<()> {
         *self.state.lock().unwrap() = SessionState::Stopped;
         self.stop_flag.store(true, Ordering::Relaxed);
-        // Copy the thread ids, then cancel without holding any tid lock
-        // (CancelSynchronousIo can block until the target I/O aborts).
-        let ot = *self.out_tid.lock().unwrap();
-        let it = *self.in_tid.lock().unwrap();
-        cancel_thread_io(ot);
-        cancel_thread_io(it);
+
+        // One cancel can land in the window between the thread's stop check and
+        // its blocking ConnectNamedPipe, leaving it blocked forever (and the
+        // Pty leaked). Keep cancelling unfinished threads until both have exited
+        // or ~1s has passed. The tid locks are released before cancelling:
+        // CancelSynchronousIo may block until the target I/O aborts.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let out_done = self.out_done.load(Ordering::Acquire);
+            let in_done = self.in_done.load(Ordering::Acquire);
+            if out_done && in_done {
+                break;
+            }
+
+            let ot = *self.out_tid.lock().unwrap();
+            let it = *self.in_tid.lock().unwrap();
+            if !out_done {
+                cancel_thread_io(ot);
+            }
+            if !in_done {
+                cancel_thread_io(it);
+            }
+
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         Ok(())
     }
 
@@ -184,22 +260,51 @@ impl Session {
         let out_tid = self.out_tid.clone();
         let connected = self.client_connected.clone();
         let requested = self.detach_requested.clone();
+        let in_gen = self.in_gen.clone();
+        let out_gen = self.out_gen.clone();
+        // Snapshot the connection generations at request time. If either moves,
+        // a new client has attached and its I/O must not be cancelled.
+        let start_in_gen = in_gen.load(Ordering::SeqCst);
+        let start_out_gen = out_gen.load(Ordering::SeqCst);
 
         thread::spawn(move || {
             // Retry until the client is gone: a single cancel can miss when the
             // target thread is between blocking calls. A fresh attach clears the
-            // request flag, which also stops this loop.
+            // request flag and bumps a generation, which also stops this loop.
             for _ in 0..50 {
                 if !connected.load(Ordering::Relaxed) || !requested.load(Ordering::Relaxed) {
                     break;
                 }
+                if in_gen.load(Ordering::SeqCst) != start_in_gen
+                    || out_gen.load(Ordering::SeqCst) != start_out_gen
+                {
+                    break;
+                }
                 let it = *in_tid.lock().unwrap();
                 let ot = *out_tid.lock().unwrap();
+                // Re-check after copying the ids but before the blocking cancel:
+                // a new client may have attached and cleared the request.
+                if !requested.load(Ordering::Relaxed)
+                    || in_gen.load(Ordering::SeqCst) != start_in_gen
+                    || out_gen.load(Ordering::SeqCst) != start_out_gen
+                {
+                    break;
+                }
                 cancel_thread_io(it);
                 cancel_thread_io(ot);
                 thread::sleep(Duration::from_millis(20));
             }
         });
+    }
+}
+
+/// Sets a flag when dropped, so a listener thread marks itself finished even on
+/// an early return.
+struct DoneOnDrop(Arc<AtomicBool>);
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -270,16 +375,38 @@ fn apply_mouse_events(data: &[u8], state: &AtomicU8) {
     });
 }
 
-/// Scans `data` together with the previous read's tail, returning the new tail.
-fn scan_with_carry(data: &[u8], carry: &mut Vec<u8>, state: &AtomicU8) {
+/// Maximum number of trailing bytes kept between reads to complete a mouse
+/// mode sequence split across a read boundary.
+const MOUSE_CARRY_MAX: usize = 256;
+
+/// Tail of `scan` that may still hold an incomplete escape sequence.
+///
+/// Keeps everything from the last ESC within the final `MOUSE_CARRY_MAX` bytes,
+/// so the next read can complete a sequence that was split. The cap bounds
+/// memory when an ESC is followed by data that never terminates.
+pub fn mouse_carry_tail(scan: &[u8]) -> &[u8] {
+    let window = &scan[scan.len().saturating_sub(MOUSE_CARRY_MAX)..];
+    match window.iter().rposition(|&b| b == 0x1b) {
+        Some(pos) => &window[pos..],
+        None => &[][..],
+    }
+}
+
+/// Scans one read (`data`) together with the previous read's tail (`carry`),
+/// applies the mouse mode toggles found to `state`, and refreshes `carry` with
+/// the bytes a sequence split across reads may still need.
+///
+/// Multi-parameter sequences such as `ESC[?1000;1002;1003;1006h` are recognised
+/// no matter where the read boundary falls.
+pub fn scan_mouse_modes(data: &[u8], carry: &mut Vec<u8>, state: &AtomicU8) {
     let mut scan = Vec::with_capacity(carry.len() + data.len());
     scan.extend_from_slice(carry);
     scan.extend_from_slice(data);
+
     apply_mouse_events(&scan, state);
 
-    let keep = scan.len().min(16);
     carry.clear();
-    carry.extend_from_slice(&scan[scan.len() - keep..]);
+    carry.extend_from_slice(mouse_carry_tail(&scan));
 }
 
 fn create_pipe(path: &str, access: windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES) -> Result<HANDLE> {
@@ -372,7 +499,7 @@ fn run_drain_thread(
                 idle_ticks = 0;
                 // Remember which mouse modes the app has enabled, so a later
                 // attach can restore them.
-                scan_with_carry(&buf[..n], &mut mouse_carry, &mouse);
+                scan_mouse_modes(&buf[..n], &mut mouse_carry, &mouse);
             }
             Status::Attached => {
                 idle_ticks = 0;
@@ -395,12 +522,13 @@ fn run_drain_thread(
 /// Accept one client, forward input to the PTY, then loop for the next client.
 fn run_in_thread(
     server: HANDLE,
-    pty: Arc<Mutex<Pty>>,
+    input_write: HANDLE,
     state: Arc<Mutex<SessionState>>,
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     detach: Arc<AtomicBool>,
     needs_repaint: Arc<AtomicBool>,
+    generation: Arc<AtomicU32>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -415,8 +543,18 @@ fn run_in_thread(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            // A failed ConnectNamedPipe can leave the instance unusable; recycle
+            // it and back off instead of spinning at full speed.
+            unsafe {
+                let _ = DisconnectNamedPipe(server);
+            }
+            thread::sleep(Duration::from_millis(20));
             continue;
         }
+
+        // A new client owns this direction now. A pending detach helper watches
+        // this counter and stops instead of cancelling the new client's I/O.
+        generation.fetch_add(1, Ordering::SeqCst);
 
         set_attached(&state);
         alive.store(true, Ordering::Relaxed);
@@ -434,7 +572,15 @@ fn run_in_thread(
             match result {
                 Ok(()) if read == 0 => break,
                 Ok(()) => {
-                    let _ = pty.lock().unwrap().write_input(&buf[..read as usize]);
+                    // Written through our own duplicate of the PTY input handle,
+                    // without the pty lock: WriteFile can block while a large
+                    // paste drains, and the out/drain threads need the lock to
+                    // keep reading output. Short writes are completed by the
+                    // helper.
+                    let _ = crate::protocol::write_all_pipe(
+                        input_write,
+                        &buf[..read as usize],
+                    );
                 }
                 Err(_) => break,
             }
@@ -451,6 +597,7 @@ fn run_in_thread(
 
     unsafe {
         let _ = CloseHandle(server);
+        let _ = CloseHandle(input_write);
     }
 }
 
@@ -464,6 +611,7 @@ fn run_out_thread(
     detach: Arc<AtomicBool>,
     needs_repaint: Arc<AtomicBool>,
     mouse: Arc<AtomicU8>,
+    generation: Arc<AtomicU32>,
 ) {
     enum LoopState {
         Data(usize),
@@ -485,8 +633,18 @@ fn run_out_thread(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            // A failed ConnectNamedPipe can leave the instance unusable; recycle
+            // it and back off instead of spinning at full speed.
+            unsafe {
+                let _ = DisconnectNamedPipe(server);
+            }
+            thread::sleep(Duration::from_millis(20));
             continue;
         }
+
+        // A new client owns this direction now. A pending detach helper watches
+        // this counter and stops instead of cancelling the new client's I/O.
+        generation.fetch_add(1, Ordering::SeqCst);
 
         // Claim the output stream under the pty lock so the drain thread cannot
         // read (and discard) bytes after this client has taken over.
@@ -551,7 +709,7 @@ fn run_out_thread(
                 LoopState::Data(n) => {
                     // Track the app's mouse modes for the current and future
                     // attach cycles.
-                    scan_with_carry(&buf[..n], &mut mouse_carry, &mouse);
+                    scan_mouse_modes(&buf[..n], &mut mouse_carry, &mouse);
 
                     let mut pos: usize = 0;
                     while pos < n {
@@ -858,5 +1016,52 @@ mod tests {
         let state = AtomicU8::new(0);
         apply_mouse_events(b"\x1b[1;2H\x1b[?25ltext\x1b[?1049h", &state);
         assert_eq!(state.load(Ordering::Relaxed), 0);
+    }
+
+    /// A multi-parameter mouse sequence must be recognised no matter where a
+    /// read boundary splits it (23 bytes: longer than the old 16-byte carry).
+    #[test]
+    fn mouse_sequence_survives_any_read_split() {
+        let seq = b"\x1b[?1000;1002;1003;1006h";
+        assert_eq!(seq.len(), 23);
+        for split in 0..=seq.len() {
+            let state = AtomicU8::new(0);
+            let mut carry = Vec::new();
+            scan_mouse_modes(&seq[..split], &mut carry, &state);
+            scan_mouse_modes(&seq[split..], &mut carry, &state);
+            assert_eq!(
+                state.load(Ordering::Relaxed),
+                1 | 2 | 4 | 8,
+                "split at byte {}",
+                split
+            );
+        }
+    }
+
+    /// Splitting ordinary output (including non-mouse CSI sequences) across
+    /// reads must not be mistaken for mouse mode changes.
+    #[test]
+    fn mouse_scan_ignores_split_non_mouse_sequences() {
+        let data = b"\x1b[1;2H\x1b[?25ltext\x1b[?1049h";
+        for split in 0..=data.len() {
+            let state = AtomicU8::new(0);
+            let mut carry = Vec::new();
+            scan_mouse_modes(&data[..split], &mut carry, &state);
+            scan_mouse_modes(&data[split..], &mut carry, &state);
+            assert_eq!(state.load(Ordering::Relaxed), 0, "split at byte {}", split);
+        }
+    }
+
+    #[test]
+    fn mouse_carry_tail_keeps_partial_sequence() {
+        assert!(mouse_carry_tail(b"plain text").is_empty());
+        assert_eq!(mouse_carry_tail(b"text\x1b[?1000;"), b"\x1b[?1000;");
+
+        // An ESC followed by more than the cap of non-sequence bytes must not
+        // grow the carry without bound.
+        let mut long = vec![b'a'; 64];
+        long.push(0x1b);
+        long.extend(std::iter::repeat(b'x').take(MOUSE_CARRY_MAX + 64));
+        assert!(mouse_carry_tail(&long).len() <= MOUSE_CARRY_MAX);
     }
 }
