@@ -716,6 +716,11 @@ fn run_out_thread(
             if r > 1 {
                 unsafe {
                     let _ = ResizePseudoConsole(hpc, COORD { X: c as i16, Y: (r - 1) as i16 });
+                    // Let the hosted app observe the shrink before restoring.
+                    // Sent back to back it sees only the final size and skips
+                    // the redraw, leaving the bottom row stale (the console
+                    // client's force_repaint waits for the same reason).
+                    thread::sleep(Duration::from_millis(120));
                     // Restore with retries: a failed restore would leave the
                     // session one row short until the next resize request.
                     for _ in 0..3 {
