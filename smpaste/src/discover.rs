@@ -81,7 +81,52 @@ const SKIPPED_O_KEYWORDS: &[&str] = &[
     // LocalCommand runs on every new connection.
     "LocalCommand",
     "PermitLocalCommand",
+    // The environment of the interactive session is not the background
+    // session's environment.
+    "SendEnv",
+    "SetEnv",
+    // A background connection must not create its own master or keep one
+    // alive. `ControlPath` is kept: with the default `ControlMaster=no` the
+    // background ssh reuses the existing master and falls back to a direct
+    // connection when the socket is gone.
+    "ControlMaster",
+    "ControlPersist",
 ];
+
+/// Shell interpreters Otty uses to wrap its login command.
+const SHELL_NAMES: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
+
+/// Whether `token` is a valid environment variable name: an ASCII letter or
+/// `_`, followed by ASCII letters, digits, or `_`.
+fn is_env_name(token: &str) -> bool {
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `token` looks like a `NAME=VALUE` environment assignment.
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => is_env_name(name),
+        None => false,
+    }
+}
+
+/// Whether the tokens after the destination are Otty's login wrapper:
+/// `<shell> -c '<command containing OTTY_REMOTE=1>'`.
+fn is_otty_login_wrapper(remote: &[String]) -> bool {
+    if remote.len() < 3 {
+        return false;
+    }
+    let shell = Path::new(&remote[0])
+        .file_name()
+        .and_then(|name| name.to_str());
+    let shell_matches = shell.is_some_and(|name| SHELL_NAMES.contains(&name));
+    shell_matches && remote[1] == "-c" && remote[2..].join("").contains("OTTY_REMOTE=1")
+}
 
 /// Parse one process command line as an interactive `ssh` invocation.
 ///
@@ -103,21 +148,23 @@ pub(crate) fn parse_ssh_argv(argv: &[String]) -> Option<SshTarget> {
 
         if arg == "--" {
             index += 1;
-            destination = Some(argv.get(index)?.clone());
+            let dest = argv.get(index)?.clone();
             index += 1;
-            if index != argv.len() {
+            if index != argv.len() && !is_otty_login_wrapper(&argv[index..]) {
                 // Anything after the destination is a remote command.
                 return None;
             }
+            destination = Some(dest);
             break;
         }
 
         let Some(rest) = arg.strip_prefix('-') else {
-            destination = Some(arg.clone());
+            let dest = arg.clone();
             index += 1;
-            if index != argv.len() {
+            if index != argv.len() && !is_otty_login_wrapper(&argv[index..]) {
                 return None;
             }
+            destination = Some(dest);
             break;
         };
 
@@ -145,20 +192,46 @@ pub(crate) fn parse_ssh_argv(argv: &[String]) -> Option<SshTarget> {
                 };
                 if option == 'o' {
                     // Without `=` the option cannot be classified reliably.
-                    if !value.contains('=') {
+                    let Some((keyword, _)) = value.split_once('=') else {
                         return None;
+                    };
+                    let keyword = keyword.trim();
+                    // `ps` splits one argv element at whitespace, so the words
+                    // of a multi-word `-o` value arrive as separate tokens.
+                    // A `SendEnv` value continues with environment names and a
+                    // `SetEnv` value with `NAME=VALUE` assignments. The last
+                    // token is never consumed: it may be the destination.
+                    let send_env = keyword.eq_ignore_ascii_case("sendenv");
+                    if send_env || keyword.eq_ignore_ascii_case("setenv") {
+                        while index + 2 < argv.len() {
+                            let candidate = &argv[index + 1];
+                            let continues = if send_env {
+                                is_env_name(candidate)
+                            } else {
+                                is_env_assignment(candidate)
+                            };
+                            if !continues {
+                                break;
+                            }
+                            index += 1;
+                        }
                     }
-                    let keyword = value.split_once('=')?.0;
                     if !SKIPPED_O_KEYWORDS
                         .iter()
-                        .any(|skip| keyword.trim().eq_ignore_ascii_case(skip))
+                        .any(|skip| keyword.eq_ignore_ascii_case(skip))
                     {
                         carried.push("-o".to_string());
                         carried.push(value);
                     }
                 } else if CARRIED_OPTIONS.contains(&option) {
-                    carried.push(format!("-{option}"));
-                    carried.push(value);
+                    // A relative path only makes sense relative to the
+                    // original session's working directory, which the
+                    // background ssh does not share.
+                    let path_option = matches!(option, 'i' | 'F' | 'S');
+                    if !path_option || value.starts_with('/') || value.starts_with('~') {
+                        carried.push(format!("-{option}"));
+                        carried.push(value);
+                    }
                 }
                 break;
             }
@@ -177,7 +250,7 @@ pub(crate) fn parse_ssh_argv(argv: &[String]) -> Option<SshTarget> {
     })
 }
 
-/// Parse `ps -ww -eo pid=,command=` output.
+/// Parse `ps -ww -x -o pid=,command=` output.
 pub(crate) fn parse_ps_output(output: &str) -> Vec<SshTarget> {
     let mut targets: Vec<SshTarget> = Vec::new();
     for line in output.lines() {
@@ -193,11 +266,16 @@ pub(crate) fn parse_ps_output(output: &str) -> Vec<SshTarget> {
         let Some(target) = parse_ssh_argv(&argv) else {
             continue;
         };
-        if !targets.iter().any(|known| known.key() == target.key()) {
+        // Several windows may be open to the same destination; one stream per
+        // host is enough.
+        if !targets
+            .iter()
+            .any(|known| known.destination == target.destination)
+        {
             targets.push(target);
         }
     }
-    targets.sort_by(|a, b| a.key().cmp(&b.key()));
+    targets.sort_by(|a, b| a.destination.cmp(&b.destination));
     targets
 }
 
@@ -269,18 +347,56 @@ mod tests {
     #[test]
     fn carries_connection_options_in_order() {
         let target = parsed(&[
-            "ssh", "-p", "2222", "-i", "key", "-F", "cfg", "-J", "bastion", "-l", "user", "-S",
-            "sock", "user@host",
+            "ssh",
+            "-p",
+            "2222",
+            "-i",
+            "/home/me/.ssh/key",
+            "-F",
+            "/home/me/.ssh/config",
+            "-J",
+            "bastion",
+            "-l",
+            "user",
+            "-S",
+            "/tmp/sock",
+            "user@host",
         ])
         .expect("interactive ssh");
         assert_eq!(target.destination, "user@host");
         assert_eq!(
             target.carried,
             argv(&[
-                "-p", "2222", "-i", "key", "-F", "cfg", "-J", "bastion", "-l", "user", "-S",
-                "sock",
+                "-p",
+                "2222",
+                "-i",
+                "/home/me/.ssh/key",
+                "-F",
+                "/home/me/.ssh/config",
+                "-J",
+                "bastion",
+                "-l",
+                "user",
+                "-S",
+                "/tmp/sock",
             ])
         );
+    }
+
+    #[test]
+    fn relative_path_options_are_not_carried() {
+        for option in ["-i", "-F", "-S"] {
+            let target =
+                parsed(&["ssh", option, "relative/path", "host"]).expect("interactive ssh");
+            assert_eq!(target.destination, "host");
+            assert!(target.carried.is_empty(), "{option}");
+
+            let target = parsed(&["ssh", option, "~/path", "host"]).expect("interactive ssh");
+            assert_eq!(target.carried, argv(&[option, "~/path"]), "{option}");
+
+            let target = parsed(&["ssh", option, "/abs/path", "host"]).expect("interactive ssh");
+            assert_eq!(target.carried, argv(&[option, "/abs/path"]), "{option}");
+        }
     }
 
     #[test]
@@ -357,6 +473,101 @@ mod tests {
     }
 
     #[test]
+    fn consumes_multi_word_send_env_values() {
+        let target = parsed(&[
+            "ssh",
+            "-o",
+            "SendEnv=COLORTERM",
+            "TERM_PROGRAM",
+            "TERM_PROGRAM_VERSION",
+            "host",
+        ])
+        .expect("interactive ssh");
+        assert_eq!(target.destination, "host");
+        assert!(target.carried.is_empty());
+
+        // The final token may be the destination even though it looks like an
+        // environment name.
+        let target = parsed(&["ssh", "-o", "SendEnv=FOO", "myhost"]).expect("interactive ssh");
+        assert_eq!(target.destination, "myhost");
+        assert!(target.carried.is_empty());
+    }
+
+    #[test]
+    fn consumes_multi_word_set_env_values() {
+        let target = parsed(&[
+            "ssh",
+            "-o",
+            "SetEnv=COLORTERM=truecolor",
+            "TERM_PROGRAM=otty",
+            "host",
+        ])
+        .expect("interactive ssh");
+        assert_eq!(target.destination, "host");
+        assert!(target.carried.is_empty());
+    }
+
+    #[test]
+    fn keeps_control_path_but_not_master_settings() {
+        let target = parsed(&[
+            "ssh",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPath=/tmp/otty-ssh.abc123/socket",
+            "-o",
+            "ControlPersist=60",
+            "host",
+        ])
+        .expect("interactive ssh");
+        assert_eq!(target.destination, "host");
+        assert_eq!(
+            target.carried,
+            argv(&["-o", "ControlPath=/tmp/otty-ssh.abc123/socket"])
+        );
+    }
+
+    #[test]
+    fn accepts_otty_login_wrapper() {
+        let target = parsed(&[
+            "ssh",
+            "-t",
+            "-i",
+            "/k",
+            "host",
+            "sh",
+            "-c",
+            "export OTTY_REMOTE=1; exec zsh",
+        ])
+        .expect("interactive ssh");
+        assert_eq!(target.destination, "host");
+        assert_eq!(target.carried, argv(&["-i", "/k"]));
+
+        // A shell path is matched by its basename.
+        let target = parsed(&[
+            "ssh",
+            "host",
+            "/bin/sh",
+            "-c",
+            "export OTTY_REMOTE=1; exec zsh",
+        ])
+        .expect("interactive ssh");
+        assert_eq!(target.destination, "host");
+    }
+
+    #[test]
+    fn rejects_non_otty_remote_commands() {
+        for command in [
+            &["ssh", "host", "sh", "-c", "echo hi"][..],
+            &["ssh", "host", "zsh", "-c", "export OTTY_REMOTE=0"][..],
+            &["ssh", "host", "bash", "echo", "OTTY_REMOTE=1"][..],
+            &["ssh", "host", "sh", "export OTTY_REMOTE=1"][..],
+        ] {
+            assert_eq!(parsed(command), None, "{command:?}");
+        }
+    }
+
+    #[test]
     fn supports_double_dash_terminator() {
         let target = parsed(&["ssh", "--", "user@host"]).expect("interactive ssh");
         assert_eq!(target.destination, "user@host");
@@ -412,6 +623,41 @@ mod tests {
         assert!(targets[0].carried.is_empty());
         assert_eq!(targets[1].destination, "user@host");
         assert_eq!(targets[1].carried, argv(&["-p", "2222"]));
+    }
+
+    #[test]
+    fn parses_real_otty_ps_output() {
+        let output = r#"84559 ssh -o SetEnv=COLORTERM=truecolor TERM_PROGRAM=otty -o SendEnv=COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION -o ControlMaster=auto -o ControlPath=/tmp/otty-ssh.6VvsRi/socket -o ControlPersist=60 dev-lan
+12490 ssh -o SetEnv=COLORTERM=truecolor TERM_PROGRAM=otty -o SendEnv=COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION -o ControlMaster=auto -o ControlPath=/tmp/otty-ssh.sh0s0Z/socket -o ControlPersist=60 -t dev-lan sh -c 'export OTTY_REMOTE=1; ... exec "$S" -i'
+56523 ssh -o SetEnv=COLORTERM=truecolor TERM_PROGRAM=otty -o SendEnv=COLORTERM TERM_PROGRAM TERM_PROGRAM_VERSION -o ControlMaster=auto -o ControlPath=/tmp/otty-ssh.eHaPVz/socket -o ControlPersist=60 -t -i id_ed25519_edux root@42.194.131.175 sh -c 'export OTTY_REMOTE=1; ...'
+12206 ssh: /tmp/otty-ssh.zj8TAj/socket [mux]
+39504 /usr/bin/ssh-agent -l
+13782 grep --color=auto --exclude-dir=.git ssh
+"#;
+        let targets = parse_ps_output(output);
+        let destinations: Vec<&str> = targets
+            .iter()
+            .map(|target| target.destination.as_str())
+            .collect();
+        assert_eq!(destinations, ["dev-lan", "root@42.194.131.175"]);
+
+        let dev_lan = &targets[0];
+        assert_eq!(
+            dev_lan.carried,
+            argv(&["-o", "ControlPath=/tmp/otty-ssh.6VvsRi/socket"])
+        );
+        for forbidden in ["SendEnv", "SetEnv", "ControlMaster", "ControlPersist"] {
+            assert!(
+                !dev_lan.carried.iter().any(|arg| arg.contains(forbidden)),
+                "{forbidden}"
+            );
+        }
+
+        let remote = &targets[1];
+        assert_eq!(
+            remote.carried,
+            argv(&["-o", "ControlPath=/tmp/otty-ssh.eHaPVz/socket"])
+        );
     }
 
     #[test]

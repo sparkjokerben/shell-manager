@@ -89,6 +89,16 @@ non-conflicting `-o` settings) are reused for the clipboard stream. Local,
 remote, and dynamic forwards are deliberately dropped: a new connection that
 binds the same ports again would fail.
 
+Otty starts its interactive sessions as `ssh … <host> sh -c 'export
+OTTY_REMOTE=1; …'`. That wrapper is recognised as the terminal's login
+command, so the session still counts as interactive. A carried
+`-o ControlPath=…` makes the background stream reuse the existing SSH master:
+it normally shares the already authenticated connection, so no separate key
+check is needed for the stream, and ssh falls back to a direct connection when
+the master is gone. Relative `-i`, `-F`, and `-S` paths are not inherited
+because the background process does not share the original working directory;
+only absolute and `~`-rooted paths are reused.
+
 Every discovered host gets its own stream. A host that disappears is closed;
 one that appears later is connected and immediately receives the newest image.
 Discovery looks at the machine's process list, so run `smpaste` as the same
@@ -97,10 +107,13 @@ something it can authenticate as.
 
 Limitations:
 
-- Only standalone `ssh` processes are visible. SSH support built into Otty and
-  `mosh` sessions are not.
+- Only standalone `ssh` processes are visible, including the `sh -c` wrapper
+  Otty adds. SSH implemented inside other applications and `mosh` sessions are
+  not.
 - Every discovered host must accept non-interactive authentication (see
-  below), because the clipboard stream has no terminal.
+  below), because the clipboard stream has no terminal. Sessions with a
+  `ControlPath` that still reaches a live master are exempt, since they reuse
+  that authenticated connection.
 - Automatic discovery is available on macOS and Linux only. On Windows pass
   `--ssh-host <alias>`.
 
