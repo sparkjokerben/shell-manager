@@ -58,10 +58,70 @@ $smw = Join-Path $bin "smw.exe"
 if (Test-Path $smw) { Move-Item -Force $smw (Join-Path $bin "smw.old.$stamp.exe") }
 Copy-Item "target\release\smw.exe" $smw -Force
 Write-Host "Web bridge deployed to $bin"
-Write-Host "If an smw instance is running, restart it to load the new embedded UI."
-Write-Host "smw is not started at logon. Start it manually, for example:"
-Write-Host "  `$env:SMW_TOKEN = '<token>'; smw"
-Write-Host "then open http://127.0.0.1:27183 (the default bind address)."
+
+# The fixed API token lives in the user environment (HKCU\Environment), so it
+# survives reboots and never appears in the logon task's command line where any
+# local process could read it. Without it smw still starts, but accepts
+# unauthenticated loopback requests only.
+$smwToken = [Environment]::GetEnvironmentVariable("SMW_TOKEN", "User")
+if (-not $smwToken) {
+    Write-Warning "SMW_TOKEN is not set for this user; smw will listen without a token on 127.0.0.1 only. Set one with [Environment]::SetEnvironmentVariable('SMW_TOKEN','...','User')."
+}
+
+$smwVbs = Join-Path $bin "smw-launch.vbs"
+Copy-Item "smw-launch.vbs" $smwVbs -Force
+
+function Get-ProdWebBridge {
+    Get-Process -Name smw -ErrorAction SilentlyContinue | Where-Object {
+        $path = $null
+        try { $path = $_.Path } catch { }
+        $path -and ($path -ieq $smw)
+    }
+}
+
+# smw is stateless: sessions live in smd, so restarting it only drops browser
+# connections. Stop the old image before starting the new one, otherwise both
+# would race for port 27183.
+$runningSmw = @(Get-ProdWebBridge)
+if ($runningSmw.Count -gt 0) {
+    $runningSmw | Stop-Process -Force -ErrorAction SilentlyContinue
+    $runningSmw | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+}
+
+# Single autostart mechanism for the bridge, mirroring smd: an interactive logon
+# task, not a Run key. Overwriting an existing task can fail with access denied
+# for a normal user, so keep one that already points at this launcher.
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "smw" -ErrorAction SilentlyContinue
+$smwTaskExists = $false
+$smwTaskOk = $false
+$null = schtasks /query /tn "smw" /fo LIST 2>$null
+if ($LASTEXITCODE -eq 0) {
+    $smwTaskExists = $true
+    $details = schtasks /query /tn "smw" /fo LIST /v 2>$null | Out-String
+    $smwTaskOk = $details -match [regex]::Escape($smwVbs)
+}
+if (-not $smwTaskExists) {
+    $smwAction = 'wscript.exe "' + $smwVbs + '"'
+    schtasks /create /tn "smw" /tr $smwAction /sc onlogon /it /f | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "schtasks /create for smw failed" }
+    Write-Host "Registered logon task 'smw'."
+} elseif ($smwTaskOk) {
+    Write-Host "Logon task 'smw' already points at $smwVbs; kept as is."
+} else {
+    Write-Warning "Task 'smw' exists but does not point at $smwVbs; update or remove it manually."
+}
+
+# Start it now. The task inherits the user environment, so it picks up
+# SMW_TOKEN. Fall back to a direct hidden launch (with the token injected into
+# this process) if the scheduler refuses because the old instance is still
+# shown as running.
+schtasks /run /tn "smw" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    if ($smwToken) { $env:SMW_TOKEN = $smwToken }
+    Start-Process -FilePath "wscript.exe" -ArgumentList ('"' + $smwVbs + '"') -WindowStyle Hidden
+}
+Write-Host "Web bridge restarted (task 'smw' runs it at logon)."
+Write-Host "Open http://127.0.0.1:27183 (the default bind address)."
 
 # Hidden launcher used by the logon task; it also pins the daemon's working
 # directory, which hosted shells inherit.

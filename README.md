@@ -58,10 +58,10 @@ cd shell-manager
 .\deploy.ps1
 ```
 
-`deploy.ps1` replaces `sm.exe` and `smw.exe` immediately. It only replaces
-`smd.exe` when the installed daemon is not running or hosts no sessions; a
-running daemon is restarted only with `-RestartDaemon`, which ends every hosted
-shell. A running `smw` keeps serving the old embedded UI until it is restarted.
+`deploy.ps1` replaces `sm.exe` and `smw.exe` immediately and restarts `smw`
+(browser connections drop; sessions keep running). It only replaces `smd.exe`
+when the installed daemon is not running or hosts no sessions; a running daemon
+is restarted only with `-RestartDaemon`, which ends every hosted shell.
 
 ## Usage
 
@@ -135,6 +135,38 @@ smw [--bind <addr>] [--port <port>] [--token <token>] [--instance <name>]
   --allow-insecure   allow a non-loopback bind without a token (dangerous)
   -h, --help         show help
   -V, --version      show the version
+```
+
+### Autostart and a fixed token
+
+A production deployment usually starts `smw` at logon. `deploy.ps1`:
+
+- copies the hidden `smw-launch.vbs` into `%USERPROFILE%\bin`;
+- registers the logon task `smw` (`schtasks /create /tn smw /sc onlogon /it`);
+- stops the old `smw` and starts the new one immediately, so the freshly
+  embedded UI takes effect.
+
+The token lives in the **user environment variable** `SMW_TOKEN`. It is stored in
+`HKCU\Environment`, survives reboots and re-logins, and never appears in the task
+definition or a process command line:
+
+```powershell
+[Environment]::SetEnvironmentVariable('SMW_TOKEN', '<token>', 'User')
+```
+
+Only processes started afterwards see it. Read, replace or delete it with:
+
+```powershell
+[Environment]::GetEnvironmentVariable('SMW_TOKEN','User')
+[Environment]::SetEnvironmentVariable('SMW_TOKEN','new-token','User')
+[Environment]::SetEnvironmentVariable('SMW_TOKEN',$null,'User')
+```
+
+Do not combine an empty token with a non-loopback bind: `smw` refuses that unless
+`--allow-insecure` is passed explicitly. To disable autostart:
+
+```powershell
+schtasks /delete /tn smw /f
 ```
 
 The instance rules match `sm`/`smd`: `SM_INSTANCE` selects a namespace, and an

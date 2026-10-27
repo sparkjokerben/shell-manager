@@ -53,10 +53,10 @@ cd shell-manager
 .\deploy.ps1
 ```
 
-`deploy.ps1` 会立即替换 `sm.exe` 与 `smw.exe`。只有当已安装的 `smd.exe` 没有在
-运行、或它没有任何会话时，脚本才会替换守护进程；要重启正在运行的守护进程必须
-显式传 `-RestartDaemon`，它会结束所有托管的 shell。正在运行的 `smw` 也会继续
-提供旧的内嵌界面，直到重启。
+`deploy.ps1` 会立即替换 `sm.exe` 与 `smw.exe`，并重启 `smw`（只断开浏览器连接，
+不影响会话）。只有当已安装的 `smd.exe` 没有在运行、或它没有任何会话时，脚本才会
+替换守护进程；要重启正在运行的守护进程必须显式传 `-RestartDaemon`，它会结束所有
+托管的 shell。
 
 ## 用法
 
@@ -124,6 +124,36 @@ smw [--bind <地址>] [--port <端口>] [--token <令牌>] [--instance <名字>]
   --allow-insecure   允许非回环绑定且不设令牌（危险）
   -h, --help         显示帮助
   -V, --version      显示版本
+```
+
+### 登录自启与固定令牌
+
+生产环境通常让 `smw` 随登录自动启动。`deploy.ps1` 会：
+
+- 把隐藏控制台窗口的 `smw-launch.vbs` 复制到 `%USERPROFILE%\bin`；
+- 注册登录任务 `smw`（`schtasks /create /tn smw /sc onlogon /it`）；
+- 停止旧的 `smw` 并立即启动新的，让新内嵌界面马上生效。
+
+令牌固定在**用户级环境变量** `SMW_TOKEN` 里。它持久化在 `HKCU\Environment`，
+重启、注销、重新登录后仍然存在，而且不会出现在任务定义或进程命令行中：
+
+```powershell
+[Environment]::SetEnvironmentVariable('SMW_TOKEN', '<令牌>', 'User')
+```
+
+设置后只有新启动的进程能读到。查看、更换或删除：
+
+```powershell
+[Environment]::GetEnvironmentVariable('SMW_TOKEN','User')
+[Environment]::SetEnvironmentVariable('SMW_TOKEN','新令牌','User')
+[Environment]::SetEnvironmentVariable('SMW_TOKEN',$null,'User')
+```
+
+不要用空令牌监听非回环地址：`smw` 会拒绝这种组合，除非显式加
+`--allow-insecure`。删除登录任务即可关闭自启：
+
+```powershell
+schtasks /delete /tn smw /f
 ```
 
 实例规则与 `sm`/`smd` 相同：`SM_INSTANCE` 选择命名空间，位于本项目 `target/`
