@@ -20,7 +20,7 @@ const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Delay before trying to start a new SSH stream after a failure.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// Default clipboard poll interval.
-const DEFAULT_INTERVAL_MS: u64 = 500;
+const DEFAULT_INTERVAL_MS: u64 = 200;
 const DEFAULT_REMOTE_SM: &str = "sm";
 /// Pixels per meter resolution stored in the BMP info header (72 DPI).
 const PIXELS_PER_METER: i32 = 2835;
@@ -66,7 +66,7 @@ const USAGE: &str = concat!(
     "Options:\n",
     "  --ssh-host <alias>     SSH host alias or user@host (required)\n",
     "  --remote-sm <command>  Remote shell-manager command (default: sm)\n",
-    "  --interval-ms <ms>     Clipboard poll interval in milliseconds (default: 500)\n",
+    "  --interval-ms <ms>     Clipboard poll interval in milliseconds (default: 200)\n",
     "  -h, --help             Print this help and exit\n",
     "\n",
     "The process keeps one SSH connection open and sends one length-prefixed\n",

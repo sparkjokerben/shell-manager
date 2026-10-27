@@ -101,10 +101,20 @@ cargo build --release -p smpaste
 smpaste --ssh-host <你的 SSH 别名>
 ```
 
-主机把最新图片暂存在 `%TEMP%\shell-manager-paste\latest.bmp`。在附着的 `sm`
-会话里按 `Ctrl+'`（终端发送的是 `0x1c`；很多键盘上 `Ctrl+\` 也是同一个字节）。
-`sm` 让守护进程把最新图片以 `CF_DIB` 写进 Windows 剪贴板，再向 Claude Code
-发送它原本的图片粘贴键，于是图片以 `[Image #N]` 附件出现，而不是路径。
+主机把最新图片暂存在 `%TEMP%\shell-manager-paste\latest.bmp`。
+
+首选方式是在 Otty 里按 `Cmd+V`：Otty 会把复制的图片写到客户端的
+`$TMPDIR/otty-paste/image-<数字>.png`，并把这个绝对路径当普通文本发出去。
+当一次输入整块就是这样的路径时，`sm` 会丢弃该文本，等待约 400ms 让 watcher
+把图片送到主机，再让守护进程把图片以 `CF_DIB` 写进 Windows 剪贴板，最后向
+Claude Code 发送它原本的图片粘贴键，于是图片以 `[Image #N]` 附件出现，而不是
+路径。若主机上还没有暂存图片，路径会照常作为文本转发。由于 `sm` 无法得知
+前台是哪个程序，在普通 shell 提示符下粘贴的路径同样会被识别；只有在主机已有
+暂存图片时才会吞掉这段文本。等待时间可用 `SM_PASTE_DELAY_MS` 调整（毫秒，
+1-10000）。
+
+手动兜底是在附着的 `sm` 会话里按 `Ctrl+'`（终端发送的是 `0x1c`；很多键盘上
+`Ctrl+\` 也是同一个字节），它同样会让守护进程发布暂存图片并发送粘贴键。
 守护进程和 Claude Code 必须在同一个 Windows 交互会话里；按下快捷键前，
 客户端 watcher 需要已经把图片送到主机。
 

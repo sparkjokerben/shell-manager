@@ -113,10 +113,22 @@ smpaste --ssh-host <your-ssh-alias>
 ```
 
 The host stages the newest image in `%TEMP%\shell-manager-paste\latest.bmp`.
-Inside an attached `sm` session press `Ctrl+'` (sent as `0x1c`; `Ctrl+\` on many
-keyboards). `sm` asks the daemon to publish the staged image on the Windows
-clipboard as `CF_DIB`, then sends Claude Code its normal image-paste key, so the
-image becomes an `[Image #N]` attachment instead of a path. The daemon and
+
+The preferred way to paste is `Cmd+V` in Otty: Otty writes the copied image to
+`$TMPDIR/otty-paste/image-<number>.png` on the client and sends that absolute
+path as plain text. When a whole input is such a path, `sm` drops the text,
+waits about 400 ms for the watcher to deliver the image, asks the daemon to
+publish it on the Windows clipboard as `CF_DIB`, and then sends Claude Code its
+normal image-paste key, so the image becomes an `[Image #N]` attachment instead
+of a path. If the host has no staged image yet, the path is forwarded as
+ordinary text instead. Because `sm` cannot see which program owns the
+foreground, a pasted path is also recognised at an ordinary shell prompt; the
+text is only swallowed when a staged image exists. The wait can be tuned with
+`SM_PASTE_DELAY_MS` (milliseconds, 1-10000).
+
+As a manual fallback, press `Ctrl+'` (sent as `0x1c`; `Ctrl+\` on many
+keyboards) inside an attached `sm` session; it asks the daemon to publish the
+staged image and then sends the paste key in the same way. The daemon and
 Claude Code must run in the same interactive Windows session, and the watcher
 must already have delivered the image.
 

@@ -2,6 +2,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::sync::Arc;
+use std::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
@@ -37,7 +38,9 @@ environment: SM_INSTANCE  use an isolated namespace for pipes, mutex and logs
                           (1-32 chars of A-Z a-z 0-9 - _; default: prod, or dev
                           when the executable runs under target/)
            SM_PASTE_TRIGGER  image-paste trigger byte (default 0x1c; 0xNN or
-                          decimal)";
+                          decimal)
+           SM_PASTE_DELAY_MS  wait for a just-copied image before pasting a
+                          detected Otty path (default 400; 1-10000)";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
@@ -600,6 +603,135 @@ fn split_paste_triggers(data: &[u8], trigger: u8) -> Vec<&[u8]> {
 /// Drop trigger bytes without acting on them (used when detach wins).
 fn strip_paste_triggers(data: &[u8], trigger: u8) -> Vec<u8> {
     data.iter().copied().filter(|&b| b != trigger).collect()
+}
+
+/// A pasted clipboard image path written by Otty.
+struct ImagePastePath {
+    /// Client-side path, for logging only.
+    path: String,
+    /// Bytes that followed the path in the same read (for example a newline
+    /// typed right after pasting). Forwarded after the paste key so the paste
+    /// still lands in order.
+    trailing: Vec<u8>,
+}
+
+/// Bracketed-paste wrappers. Otty itself writes the path bare, but other
+/// terminals may wrap pasted text.
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Image extensions accepted for a pasted Otty path.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"];
+
+/// Recognise input whose whole content is a client-side Otty image path.
+///
+/// Otty stores a pasted image in `$TMPDIR/otty-paste/` and sends the absolute
+/// path as plain text. `sm` turns that text back into a real clipboard paste
+/// instead of forwarding it.
+fn image_paste_path(data: &[u8]) -> Option<ImagePastePath> {
+    // Everything is text: a stray non-UTF-8 byte means this is not a path.
+    let text = std::str::from_utf8(data).ok()?;
+    let (candidate, after) = if let Some(rest) = data.strip_prefix(BRACKETED_PASTE_START) {
+        let end = rest
+            .windows(BRACKETED_PASTE_END.len())
+            .position(|w| w == BRACKETED_PASTE_END)?;
+        let candidate = std::str::from_utf8(&rest[..end]).ok()?;
+        (candidate, &rest[end + BRACKETED_PASTE_END.len()..])
+    } else {
+        (text, &[][..])
+    };
+
+    // Trim the trailing whitespace Otty or the user added after the path; those
+    // bytes still have to reach the hosted program after the paste key.
+    let token = candidate.trim_end_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    let trimmed = &candidate[token.len()..];
+    let mut trailing = Vec::with_capacity(trimmed.len() + after.len());
+    trailing.extend_from_slice(trimmed.as_bytes());
+    trailing.extend_from_slice(after);
+
+    // A shell may quote a pasted path. Only a matching pair is acceptable.
+    let path = if let Some(inner) = token
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    {
+        inner
+    } else if let Some(inner) = token
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+    {
+        inner
+    } else if token.contains(['\'', '"']) {
+        return None;
+    } else {
+        token
+    };
+
+    if path.is_empty()
+        || !path.starts_with('/')
+        || path.chars().any(|c| c.is_whitespace() || c.is_control())
+        || !path.contains("/otty-paste/")
+    {
+        return None;
+    }
+    let name = path.rsplit('/').next().unwrap_or("");
+    let extension = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    if !IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+        return None;
+    }
+
+    Some(ImagePastePath {
+        path: path.to_string(),
+        trailing,
+    })
+}
+
+/// Time to wait for a just-copied image to reach the host before the paste
+/// key is injected. The client watcher polls every 200 ms.
+const PASTE_STAGE_DELAY: Duration = Duration::from_millis(400);
+
+/// Name of the environment override for the staging delay.
+const PASTE_STAGE_DELAY_ENV: &str = "SM_PASTE_DELAY_MS";
+
+/// Parse the staging delay in milliseconds, accepting 1 through 10_000.
+fn parse_paste_delay(raw: &str) -> Option<Duration> {
+    let ms: u64 = raw.trim().parse().ok()?;
+    (1..=10_000).contains(&ms).then(|| Duration::from_millis(ms))
+}
+
+/// Staging delay from `SM_PASTE_DELAY_MS`, falling back to `PASTE_STAGE_DELAY`.
+fn paste_stage_delay() -> Duration {
+    match std::env::var(PASTE_STAGE_DELAY_ENV) {
+        Ok(raw) => parse_paste_delay(&raw).unwrap_or_else(|| {
+            client_log(&format!(
+                "ignoring invalid {}={:?}; using {:?}",
+                PASTE_STAGE_DELAY_ENV, raw, PASTE_STAGE_DELAY
+            ));
+            PASTE_STAGE_DELAY
+        }),
+        Err(_) => PASTE_STAGE_DELAY,
+    }
+}
+
+/// Ask the daemon to publish the staged image on the clipboard.
+fn request_paste_image(name: &str) -> bool {
+    let req = Request {
+        op: Op::PasteImage,
+        name: name.to_string(),
+        wsl: None,
+        cols: None,
+        rows: None,
+    };
+    match protocol::pipe_request(protocol::control_pipe(), &req) {
+        Ok(resp) if resp.ok => true,
+        Ok(resp) => {
+            client_log(&format!("image paste failed: {}", resp.error));
+            false
+        }
+        Err(e) => {
+            client_log(&format!("image paste request failed: {:#}", e));
+            false
+        }
+    }
 }
 
 /// Detach triggers. The printable sequence works from any keyboard and is not
@@ -1207,6 +1339,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
     let stdin_reader_tid = reader_tid.clone();
     let paste_name = name.to_string();
     let paste_trigger = paste_trigger_byte();
+    let paste_delay = paste_stage_delay();
     client_log(&format!("image paste trigger byte 0x{:02x}", paste_trigger));
 
     let stdin_thread = std::thread::spawn(move || -> Result<()> {
@@ -1272,6 +1405,37 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
                         stop_reader(&stdin_reader_tid, &stdin_done);
                         break;
                     }
+                    // A whole-read Otty image path (Cmd+V) is turned into a
+                    // real paste. If the watcher has not delivered an image
+                    // yet, the path is forwarded as ordinary text instead.
+                    if let Some(paste) = image_paste_path(&forward) {
+                        if shell_manager::clipboard::stage_path().exists() {
+                            client_log(&format!(
+                                "image path paste: {} (waiting {:?} for staging)",
+                                paste.path, paste_delay
+                            ));
+                            std::thread::sleep(paste_delay);
+                            client_log("image paste triggered (path)");
+                            let _ = request_paste_image(&paste_name);
+                            // Inject the paste key even when the clipboard
+                            // update failed, so the failure stays visible
+                            // instead of swallowing the user's action.
+                            if !write_all(h_in, PASTE_KEY)? {
+                                client_log("stdin forward failed");
+                                return Ok(());
+                            }
+                            if !paste.trailing.is_empty()
+                                && !write_all(h_in, &paste.trailing)?
+                            {
+                                client_log("stdin forward failed");
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        client_log(
+                            "image path paste seen but no staged image; forwarding path text",
+                        );
+                    }
                     // Ctrl+' arrives as the raw 0x1c byte. The Win32-input-mode
                     // report path above is deliberately not used for image
                     // paste: Otty (the paste bridge's terminal) does not
@@ -1287,23 +1451,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
                         // the next segment. A single read may contain several.
                         if index + 1 < parts.len() {
                             client_log("image paste triggered");
-                            let req = Request {
-                                op: Op::PasteImage,
-                                name: paste_name.clone(),
-                                wsl: None,
-                                cols: None,
-                                rows: None,
-                            };
-                            match protocol::pipe_request(protocol::control_pipe(), &req) {
-                                Ok(resp) if resp.ok => {}
-                                Ok(resp) => {
-                                    client_log(&format!("image paste failed: {}", resp.error))
-                                }
-                                Err(e) => client_log(&format!(
-                                    "image paste request failed: {:#}",
-                                    e
-                                )),
-                            }
+                            let _ = request_paste_image(&paste_name);
                             // Inject the app-level paste key even when the
                             // clipboard update failed, so the failure stays
                             // visible instead of swallowing the keystroke.
@@ -1460,10 +1608,12 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_motion, parse_paste_trigger, read_paste_frame, split_paste_triggers,
-        strip_paste_triggers, strip_client_modes, DetachDetector, Win32Detach, PASTE_TRIGGER,
+        filter_motion, image_paste_path, parse_paste_delay, parse_paste_trigger,
+        read_paste_frame, split_paste_triggers, strip_client_modes, strip_paste_triggers,
+        DetachDetector, Win32Detach, PASTE_TRIGGER,
     };
     use std::io::Cursor;
+    use std::time::Duration;
 
     #[test]
     fn f12_detaches() {
@@ -1756,6 +1906,92 @@ mod tests {
         // Above the 64 MiB cap, rejected before allocating.
         let mut input = Cursor::new((65u32 * 1024 * 1024).to_be_bytes().to_vec());
         assert!(read_paste_frame(&mut input).is_err());
+    }
+
+    const OTTY_IMAGE_PATH: &str =
+        "/var/folders/v2/l3yrrlmx7y9cmq6msl3gjs0r0000gn/T/otty-paste/image-1793094876888.png";
+
+    #[test]
+    fn otty_image_path_is_recognised() {
+        let paste = image_paste_path(OTTY_IMAGE_PATH.as_bytes()).expect("path");
+        assert_eq!(paste.path, OTTY_IMAGE_PATH);
+        assert!(paste.trailing.is_empty());
+    }
+
+    #[test]
+    fn otty_image_path_keeps_trailing_newline() {
+        let input = format!("{}\r\n", OTTY_IMAGE_PATH);
+        let paste = image_paste_path(input.as_bytes()).expect("path");
+        assert_eq!(paste.path, OTTY_IMAGE_PATH);
+        assert_eq!(paste.trailing, b"\r\n");
+    }
+
+    #[test]
+    fn quoted_otty_paths_are_recognised_only_in_pairs() {
+        let single = format!("'{}'", OTTY_IMAGE_PATH);
+        let paste = image_paste_path(single.as_bytes()).expect("single quotes");
+        assert_eq!(paste.path, OTTY_IMAGE_PATH);
+        assert!(paste.trailing.is_empty());
+
+        let double = format!("\"{}\"", OTTY_IMAGE_PATH);
+        let paste = image_paste_path(double.as_bytes()).expect("double quotes");
+        assert_eq!(paste.path, OTTY_IMAGE_PATH);
+
+        for unbalanced in [
+            format!("'{}", OTTY_IMAGE_PATH),
+            format!("{}'", OTTY_IMAGE_PATH),
+            format!("\"{}", OTTY_IMAGE_PATH),
+            format!("{}\"", OTTY_IMAGE_PATH),
+        ] {
+            assert!(
+                image_paste_path(unbalanced.as_bytes()).is_none(),
+                "{unbalanced}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_path_keeps_bytes_after_the_wrapper() {
+        let input = format!("\x1b[200~{}\x1b[201~\r\n", OTTY_IMAGE_PATH);
+        let paste = image_paste_path(input.as_bytes()).expect("bracketed");
+        assert_eq!(paste.path, OTTY_IMAGE_PATH);
+        assert_eq!(paste.trailing, b"\r\n");
+
+        // Without the closing marker the read is not a complete paste.
+        let open = format!("\x1b[200~{}", OTTY_IMAGE_PATH);
+        assert!(image_paste_path(open.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn uppercase_image_extension_is_recognised() {
+        let input = OTTY_IMAGE_PATH.replace(".png", ".PNG");
+        assert!(image_paste_path(input.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn non_single_image_paths_are_rejected() {
+        // Two paths in one read are ordinary text, not one paste.
+        let two = format!("{} {}", OTTY_IMAGE_PATH, OTTY_IMAGE_PATH);
+        assert!(image_paste_path(two.as_bytes()).is_none());
+
+        assert!(image_paste_path(b"otty-paste/image-1.png").is_none());
+        assert!(image_paste_path(b"/tmp/image-1.png").is_none());
+        assert!(image_paste_path(b"/tmp/otty-paste/image-1.txt").is_none());
+        assert!(image_paste_path(b"/tmp/otty-paste/image-\n1.png").is_none());
+        assert!(image_paste_path(b"/tmp/otty-paste/image-1.png\xff").is_none());
+    }
+
+    #[test]
+    fn paste_delay_override_is_parsed() {
+        assert_eq!(parse_paste_delay("400"), Some(Duration::from_millis(400)));
+        assert_eq!(parse_paste_delay(" 1 "), Some(Duration::from_millis(1)));
+        assert_eq!(
+            parse_paste_delay("10000"),
+            Some(Duration::from_millis(10_000))
+        );
+        assert_eq!(parse_paste_delay("0"), None);
+        assert_eq!(parse_paste_delay("10001"), None);
+        assert_eq!(parse_paste_delay("nope"), None);
     }
 }
 

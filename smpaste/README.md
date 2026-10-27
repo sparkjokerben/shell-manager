@@ -16,6 +16,11 @@ keeps the resident process cheap and avoids repeated macOS clipboard-permission
 prompts. Linux has no portable change counter, so it reads the clipboard on
 every poll.
 
+When Otty pastes an image, the host receives its path and waits about 400 ms
+for this watcher to deliver the image before injecting the paste key. Keep the
+poll interval at or below roughly 300 ms (the default is 200 ms), or raise the
+host's wait with `SM_PASTE_DELAY_MS`.
+
 ## Build
 
 ```sh
@@ -42,14 +47,14 @@ first launch.
 
 ```sh
 smpaste --ssh-host my-server
-smpaste --ssh-host user@example.com --remote-sm /usr/local/bin/sm --interval-ms 500
+smpaste --ssh-host user@example.com --remote-sm /usr/local/bin/sm --interval-ms 200
 ```
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--ssh-host <alias>` | required | Host alias from `~/.ssh/config`, or `user@host` |
 | `--remote-sm <command>` | `sm` | Remote shell-manager command |
-| `--interval-ms <ms>` | `500` | Clipboard poll interval |
+| `--interval-ms <ms>` | `200` | Clipboard poll interval |
 
 Logs are written to stderr. The process starts
 `ssh -T <ssh-host> <remote-sm> clipboard-image --stream`, keeps its stdin open,
