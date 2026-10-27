@@ -25,9 +25,9 @@
 
   --font-display: Bahnschrift, "Aptos Display", "Segoe UI Variable Display", "Segoe UI", sans-serif;
   --font-ui: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
-  /* 终端：西文与 Nerd Font 图标用 Ubuntu Mono Nerd Font，中文用苹方；
-     PingFang 前保留系统等宽字体兜底，避免缺少 Ubuntu Mono 的机器
-     用比例字体测量字符宽度而错位。 */
+  /* 终端：西文与 Nerd Font 图标用随前端打包的 Ubuntu Mono Nerd Font，
+     中文用系统苹方；苹方前保留系统等宽字体兜底，避免字体加载失败时
+     回退到比例字体而让字符宽度测量错位。 */
   --font-mono: "UbuntuMono Nerd Font", "Cascadia Mono", "Cascadia Code", Consolas, "Courier New", "PingFang SC", monospace;
 
   --masthead-h: 64px;

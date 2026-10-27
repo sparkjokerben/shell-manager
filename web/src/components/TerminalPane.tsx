@@ -153,6 +153,7 @@ export function TerminalPane({
   const [detail, setDetail] = useState(`正在附着到 ${session.name}…`);
   const [occupied, setOccupied] = useState(false);
   const [attempt, setAttempt] = useState<Attempt>({ id: 0, takeover: false });
+  const [fontsReady, setFontsReady] = useState(false);
 
   useEffect(() => {
     onConnectionChangeRef.current = onConnectionChange;
@@ -172,6 +173,32 @@ export function TerminalPane({
       setAttempt((current) => ({ id: current.id + 1, takeover: false }));
     }
   }, [attachSignal]);
+
+  /**
+   * xterm 在 open 时按当前字体测量字符宽度；捆绑字体还没加载完就会退回到
+   * 系统字体测量，网格会一直错位。等常规与粗体都就绪后再创建终端；
+   * 字体加载失败或超时也继续，只是使用兜底字体。
+   */
+  useEffect(() => {
+    let cancelled = false;
+    let timeout = 0;
+    const finish = () => {
+      window.clearTimeout(timeout);
+      if (!cancelled) {
+        setFontsReady(true);
+      }
+    };
+    const font = '13px "UbuntuMono Nerd Font"';
+    timeout = window.setTimeout(finish, 3000);
+    void Promise.allSettled([
+      document.fonts.load(font),
+      document.fonts.load(`700 ${font}`),
+    ]).then(finish);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, []);
 
   const sendMessage = useCallback((message: WsClientMessage) => {
     const socket = socketRef.current;
@@ -245,6 +272,9 @@ export function TerminalPane({
   }, [fitTerminal]);
 
   useEffect(() => {
+    if (!fontsReady) {
+      return;
+    }
     const host = hostRef.current;
     if (!host) {
       return;
@@ -339,9 +369,12 @@ export function TerminalPane({
       terminalRef.current = null;
       fitRef.current = null;
     };
-  }, [fitTerminalAndStick, scheduleResize, sendInput]);
+  }, [fitTerminalAndStick, fontsReady, scheduleResize, sendInput]);
 
   useEffect(() => {
+    if (!fontsReady) {
+      return;
+    }
     const terminal = terminalRef.current;
     if (!terminal) {
       return;
@@ -533,7 +566,7 @@ export function TerminalPane({
         }
       }
     };
-  }, [attempt, fitTerminal, sendMessage, session.name, token]);
+  }, [attempt, fitTerminal, fontsReady, sendMessage, session.name, token]);
 
   const reconnect = (takeover: boolean) => {
     setAttempt((current) => ({ id: current.id + 1, takeover }));

@@ -1,0 +1,18 @@
+/* Ubuntu Mono Nerd Font 随前端打包（Ubuntu Font Licence 1.0，见
+   public/fonts/UbuntuMono-LICENSE.txt），不依赖本机安装或外部 CDN。
+   西文与 Nerd Font 图标用这两个字重，中文仍由系统苹方等字体兜底。 */
+@font-face {
+  font-family: "UbuntuMono Nerd Font";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../assets/fonts/UbuntuMonoNerdFont-Regular.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "UbuntuMono Nerd Font";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("../assets/fonts/UbuntuMonoNerdFont-Bold.woff2") format("woff2");
+}
