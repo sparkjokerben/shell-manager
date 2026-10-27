@@ -10,6 +10,12 @@ Each image is sent as one frame: a 4-byte big-endian length followed by a
 content changes. After an SSH failure the client reconnects every two seconds
 and replays the last image once.
 
+On Windows and macOS the watcher first checks the platform clipboard change
+counter and only reads image data after the clipboard actually changed. This
+keeps the resident process cheap and avoids repeated macOS clipboard-permission
+prompts. Linux has no portable change counter, so it reads the clipboard on
+every poll.
+
 ## Build
 
 ```sh

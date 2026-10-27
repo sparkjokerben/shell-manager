@@ -35,7 +35,9 @@ options: --wsl  create the session with wsl.exe instead of PowerShell
          --stream  keep reading frames until stdin reaches EOF (clipboard-image)
 environment: SM_INSTANCE  use an isolated namespace for pipes, mutex and logs
                           (1-32 chars of A-Z a-z 0-9 - _; default: prod, or dev
-                          when the executable runs under target/)";
+                          when the executable runs under target/)
+           SM_PASTE_TRIGGER  image-paste trigger byte (default 0x1c; 0xNN or
+                          decimal)";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
@@ -558,18 +560,46 @@ fn client_log(msg: &str) {
 /// forwarded to the hosted program.
 const PASTE_TRIGGER: u8 = 0x1c;
 
+/// Name of the environment override for the trigger byte.
+const PASTE_TRIGGER_ENV: &str = "SM_PASTE_TRIGGER";
+
+/// Parse `0xNN` or a decimal byte value.
+fn parse_paste_trigger(raw: &str) -> Option<u8> {
+    let raw = raw.trim();
+    let value = if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()?
+    } else {
+        raw.parse::<u16>().ok()?
+    };
+    u8::try_from(value).ok()
+}
+
+/// Trigger byte from `SM_PASTE_TRIGGER`, falling back to `PASTE_TRIGGER`.
+fn paste_trigger_byte() -> u8 {
+    match std::env::var(PASTE_TRIGGER_ENV) {
+        Ok(raw) => parse_paste_trigger(&raw).unwrap_or_else(|| {
+            client_log(&format!(
+                "ignoring invalid {}={:?}; using 0x{:02x}",
+                PASTE_TRIGGER_ENV, raw, PASTE_TRIGGER
+            ));
+            PASTE_TRIGGER
+        }),
+        Err(_) => PASTE_TRIGGER,
+    }
+}
+
 /// Claude Code's image-paste key on Windows (Alt+V, sent as ESC v).
 const PASTE_KEY: &[u8] = b"\x1bv";
 
 /// Split forwarded input on the image-paste trigger, dropping each trigger
 /// byte. Every gap between segments means "paste the staged image".
-fn split_paste_triggers(data: &[u8]) -> Vec<&[u8]> {
-    data.split(|&b| b == PASTE_TRIGGER).collect()
+fn split_paste_triggers(data: &[u8], trigger: u8) -> Vec<&[u8]> {
+    data.split(|&b| b == trigger).collect()
 }
 
 /// Drop trigger bytes without acting on them (used when detach wins).
-fn strip_paste_triggers(data: &[u8]) -> Vec<u8> {
-    data.iter().copied().filter(|&b| b != PASTE_TRIGGER).collect()
+fn strip_paste_triggers(data: &[u8], trigger: u8) -> Vec<u8> {
+    data.iter().copied().filter(|&b| b != trigger).collect()
 }
 
 /// Detach triggers. The printable sequence works from any keyboard and is not
@@ -1176,6 +1206,8 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
     let stdin_done = reader_done.clone();
     let stdin_reader_tid = reader_tid.clone();
     let paste_name = name.to_string();
+    let paste_trigger = paste_trigger_byte();
+    client_log(&format!("image paste trigger byte 0x{:02x}", paste_trigger));
 
     let stdin_thread = std::thread::spawn(move || -> Result<()> {
         let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
@@ -1232,7 +1264,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
                         // tearing the connection down. Detach wins over image
                         // paste, so any trigger in the prefix is dropped rather
                         // than acted on or forwarded.
-                        let prefix = strip_paste_triggers(&forward);
+                        let prefix = strip_paste_triggers(&forward, paste_trigger);
                         if !prefix.is_empty() {
                             let _ = write_all(h_in, &prefix);
                         }
@@ -1245,7 +1277,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
                     // paste: Otty (the paste bridge's terminal) does not
                     // implement CSI ? 9001 h, so keys are never encoded as
                     // reports.
-                    let parts = split_paste_triggers(&forward);
+                    let parts = split_paste_triggers(&forward, paste_trigger);
                     for (index, part) in parts.iter().enumerate() {
                         if !part.is_empty() && !write_all(h_in, part)? {
                             client_log("stdin forward failed");
@@ -1428,8 +1460,8 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_motion, read_paste_frame, split_paste_triggers, strip_paste_triggers,
-        strip_client_modes, DetachDetector, Win32Detach,
+        filter_motion, parse_paste_trigger, read_paste_frame, split_paste_triggers,
+        strip_paste_triggers, strip_client_modes, DetachDetector, Win32Detach, PASTE_TRIGGER,
     };
     use std::io::Cursor;
 
@@ -1660,28 +1692,31 @@ mod tests {
     #[test]
     fn paste_trigger_splits_promptly() {
         // No trigger: the whole input is one forwardable segment.
-        assert_eq!(split_paste_triggers(b"abc"), vec![&b"abc"[..]]);
+        assert_eq!(
+            split_paste_triggers(b"abc", PASTE_TRIGGER),
+            vec![&b"abc"[..]]
+        );
         // One trigger separates the prefix from the suffix.
         assert_eq!(
-            split_paste_triggers(b"ab\x1ccd"),
+            split_paste_triggers(b"ab\x1ccd", PASTE_TRIGGER),
             vec![&b"ab"[..], &b"cd"[..]]
         );
         // Several triggers in one read, including back-to-back ones.
         assert_eq!(
-            split_paste_triggers(b"\x1c\x1c"),
+            split_paste_triggers(b"\x1c\x1c", PASTE_TRIGGER),
             vec![&b""[..], &b""[..], &b""[..]]
         );
         // A trigger at the very end leaves an empty segment after it.
         assert_eq!(
-            split_paste_triggers(b"x\x1c"),
+            split_paste_triggers(b"x\x1c", PASTE_TRIGGER),
             vec![&b"x"[..], &b""[..]]
         );
     }
 
     #[test]
     fn detach_prefix_drops_paste_triggers() {
-        assert_eq!(strip_paste_triggers(b"a\x1cb\x1c"), b"ab");
-        assert_eq!(strip_paste_triggers(b"abc"), b"abc");
+        assert_eq!(strip_paste_triggers(b"a\x1cb\x1c", PASTE_TRIGGER), b"ab");
+        assert_eq!(strip_paste_triggers(b"abc", PASTE_TRIGGER), b"abc");
     }
 
     #[test]
@@ -1691,7 +1726,17 @@ mod tests {
         let mut d = DetachDetector::new();
         let (forward, detach) = d.feed(b"a\x1cb\x1b[24~");
         assert!(detach);
-        assert_eq!(strip_paste_triggers(&forward), b"ab");
+        assert_eq!(strip_paste_triggers(&forward, PASTE_TRIGGER), b"ab");
+    }
+
+    #[test]
+    fn paste_trigger_override_is_parsed() {
+        assert_eq!(parse_paste_trigger("0x1c"), Some(0x1c));
+        assert_eq!(parse_paste_trigger("0X1C"), Some(0x1c));
+        assert_eq!(parse_paste_trigger("28"), Some(0x1c));
+        assert_eq!(parse_paste_trigger(" 0x07 "), Some(0x07));
+        assert_eq!(parse_paste_trigger("0x100"), None);
+        assert_eq!(parse_paste_trigger("nope"), None);
     }
 
     #[test]

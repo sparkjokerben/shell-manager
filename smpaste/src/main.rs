@@ -28,6 +28,32 @@ const PIXELS_PER_METER: i32 = 2835;
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Cheap clipboard generation counter.
+///
+/// Reading image data on every poll is expensive and, on macOS, can trigger
+/// repeated clipboard-permission prompts. When the platform exposes a change
+/// counter we only read the image after it moves. `None` means there is no
+/// cheap counter, so the caller falls back to polling the data every interval.
+mod platform {
+    #[cfg(windows)]
+    pub fn clipboard_sequence() -> Option<u64> {
+        Some(unsafe {
+            windows::Win32::System::DataExchange::GetClipboardSequenceNumber() as u64
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clipboard_sequence() -> Option<u64> {
+        let pasteboard = unsafe { objc2_app_kit::NSPasteboard::generalPasteboard() };
+        Some(unsafe { pasteboard.changeCount() } as u64)
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub fn clipboard_sequence() -> Option<u64> {
+        None
+    }
+}
+
 const USAGE: &str = concat!(
     "smpaste ",
     env!("CARGO_PKG_VERSION"),
@@ -159,6 +185,7 @@ fn run(opts: Options) -> Result<()> {
     let mut watcher = ClipboardWatcher::default();
     let mut last_hash: Option<u64> = None;
     let mut last_bmp: Option<Vec<u8>> = None;
+    let mut last_sequence = platform::clipboard_sequence();
 
     // Seed the pipeline with whatever is already on the clipboard.
     if let Some(image) = watcher.poll(&mut clipboard) {
@@ -248,6 +275,13 @@ fn run(opts: Options) -> Result<()> {
             thread::sleep(RECONNECT_DELAY);
             continue;
         }
+
+        let sequence = platform::clipboard_sequence();
+        if sequence.is_some() && sequence == last_sequence {
+            // Nothing was copied since the last poll; skip reading the data.
+            continue;
+        }
+        last_sequence = sequence;
 
         let Some(image) = watcher.poll(&mut clipboard) else {
             continue;
