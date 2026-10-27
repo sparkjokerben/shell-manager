@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::os::windows::ffi::OsStrExt;
 use std::ffi::OsStr;
 use std::io::Read;
@@ -615,10 +616,14 @@ struct ImagePastePath {
     trailing: Vec<u8>,
 }
 
-/// Bracketed-paste wrappers. Otty itself writes the path bare, but other
-/// terminals may wrap pasted text.
+/// Bracketed-paste wrappers. Otty wraps a Cmd+V image path in these markers,
+/// and the markers may be split from the path across stdin reads.
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Longest bracketed paste worth holding back. Anything larger cannot be a
+/// single image path, so it is forwarded unchanged once it crosses this.
+const MAX_BRACKETED_PASTE: usize = 4096;
 
 /// Image extensions accepted for a pasted Otty path.
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"];
@@ -626,8 +631,10 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", 
 /// Recognise input whose whole content is a client-side Otty image path.
 ///
 /// Otty stores a pasted image in `$TMPDIR/otty-paste/` and sends the absolute
-/// path as plain text. `sm` turns that text back into a real clipboard paste
-/// instead of forwarding it.
+/// path wrapped in a bracketed paste. The start marker and the path can arrive
+/// in different stdin reads; `BracketedPaste` reassembles them before this
+/// check. A bare path is also accepted for terminals that do not wrap. `sm`
+/// turns the path back into a real clipboard paste instead of forwarding it.
 fn image_paste_path(data: &[u8]) -> Option<ImagePastePath> {
     // Everything is text: a stray non-UTF-8 byte means this is not a path.
     let text = std::str::from_utf8(data).ok()?;
@@ -683,6 +690,53 @@ fn image_paste_path(data: &[u8]) -> Option<ImagePastePath> {
         path: path.to_string(),
         trailing,
     })
+}
+
+/// Whether `data` contains the bracketed-paste end marker.
+fn contains_bracketed_paste_end(data: &[u8]) -> bool {
+    data.windows(BRACKETED_PASTE_END.len())
+        .any(|window| window == BRACKETED_PASTE_END)
+}
+
+/// Reassembles a bracketed paste that arrives split across reads.
+#[derive(Default)]
+struct BracketedPaste {
+    pending: Option<Vec<u8>>,
+}
+
+enum PasteStep {
+    /// Not an incomplete bracketed paste; process this read normally.
+    PassThrough,
+    /// The read was buffered; nothing may be forwarded yet.
+    Buffered,
+    /// A complete paste (or one too large to be a path) to process as a whole.
+    Complete(Vec<u8>),
+}
+
+impl BracketedPaste {
+    /// Feed one stdin read, holding back a paste that has not ended yet.
+    fn feed(&mut self, data: &[u8]) -> PasteStep {
+        if self.pending.is_some() {
+            let complete = {
+                let pending = self.pending.as_mut().expect("pending paste");
+                pending.extend_from_slice(data);
+                contains_bracketed_paste_end(pending) || pending.len() > MAX_BRACKETED_PASTE
+            };
+            if complete {
+                return PasteStep::Complete(self.pending.take().unwrap_or_default());
+            }
+            return PasteStep::Buffered;
+        }
+
+        // The start marker always arrives whole, so only a complete opening
+        // marker is worth buffering.
+        if data.starts_with(BRACKETED_PASTE_START) && !contains_bracketed_paste_end(data) {
+            self.pending = Some(data.to_vec());
+            return PasteStep::Buffered;
+        }
+
+        PasteStep::PassThrough
+    }
 }
 
 /// Time to wait for a just-copied image to reach the host before the paste
@@ -1348,6 +1402,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
         let mut detector = DetachDetector::new();
         let mut motion_pending: Vec<u8> = Vec::new();
         let mut win32 = Win32Detach::new();
+        let mut bracketed = BracketedPaste::default();
         let mut hover_reads: u32 = 0;
         client_log("stdin thread started");
         loop {
@@ -1405,10 +1460,22 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
                         stop_reader(&stdin_reader_tid, &stdin_done);
                         break;
                     }
+                    // Otty sends a Cmd+V image path as a bracketed paste, and
+                    // the closing marker usually lands in the next read. Hold
+                    // the opening marker back until the paste is complete, then
+                    // process the reassembled block below.
+                    let payload: Cow<[u8]> = match bracketed.feed(&forward) {
+                        PasteStep::Buffered => {
+                            client_log("bracketed paste: waiting for end marker");
+                            continue;
+                        }
+                        PasteStep::Complete(buf) => Cow::Owned(buf),
+                        PasteStep::PassThrough => Cow::Borrowed(&forward[..]),
+                    };
                     // A whole-read Otty image path (Cmd+V) is turned into a
                     // real paste. If the watcher has not delivered an image
                     // yet, the path is forwarded as ordinary text instead.
-                    if let Some(paste) = image_paste_path(&forward) {
+                    if let Some(paste) = image_paste_path(&payload) {
                         if shell_manager::clipboard::stage_path().exists() {
                             client_log(&format!(
                                 "image path paste: {} (waiting {:?} for staging)",
@@ -1441,7 +1508,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
                     // paste: Otty (the paste bridge's terminal) does not
                     // implement CSI ? 9001 h, so keys are never encoded as
                     // reports.
-                    let parts = split_paste_triggers(&forward, paste_trigger);
+                    let parts = split_paste_triggers(&payload, paste_trigger);
                     for (index, part) in parts.iter().enumerate() {
                         if !part.is_empty() && !write_all(h_in, part)? {
                             client_log("stdin forward failed");
@@ -1610,7 +1677,8 @@ mod tests {
     use super::{
         filter_motion, image_paste_path, parse_paste_delay, parse_paste_trigger,
         read_paste_frame, split_paste_triggers, strip_client_modes, strip_paste_triggers,
-        DetachDetector, Win32Detach, PASTE_TRIGGER,
+        BracketedPaste, DetachDetector, PasteStep, Win32Detach, BRACKETED_PASTE_START,
+        MAX_BRACKETED_PASTE, PASTE_TRIGGER,
     };
     use std::io::Cursor;
     use std::time::Duration;
@@ -1960,6 +2028,92 @@ mod tests {
         // Without the closing marker the read is not a complete paste.
         let open = format!("\x1b[200~{}", OTTY_IMAGE_PATH);
         assert!(image_paste_path(open.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn bracketed_paste_split_across_reads_is_reassembled() {
+        let mut paste = BracketedPaste::default();
+        assert!(matches!(paste.feed(b"\x1b[200~"), PasteStep::Buffered));
+
+        let mut second = OTTY_IMAGE_PATH.as_bytes().to_vec();
+        second.extend_from_slice(b"\x1b[201~");
+        let PasteStep::Complete(buf) = paste.feed(&second) else {
+            panic!("paste should complete in the second read");
+        };
+        let path = image_paste_path(&buf).expect("path");
+        assert_eq!(path.path, OTTY_IMAGE_PATH);
+        assert!(path.trailing.is_empty());
+    }
+
+    #[test]
+    fn complete_bracketed_paste_in_one_read_passes_through() {
+        let mut paste = BracketedPaste::default();
+        let input = format!("\x1b[200~{}\x1b[201~", OTTY_IMAGE_PATH);
+        assert!(matches!(
+            paste.feed(input.as_bytes()),
+            PasteStep::PassThrough
+        ));
+        assert!(image_paste_path(input.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn ordinary_input_passes_through() {
+        let mut paste = BracketedPaste::default();
+        assert!(matches!(paste.feed(b"a"), PasteStep::PassThrough));
+        assert!(matches!(paste.feed(b"\x1b[20"), PasteStep::PassThrough));
+        assert!(matches!(paste.feed(b"\x1b[201~"), PasteStep::PassThrough));
+    }
+
+    #[test]
+    fn oversized_bracketed_paste_is_flushed_unchanged() {
+        let mut paste = BracketedPaste::default();
+        assert!(matches!(paste.feed(b"\x1b[200~"), PasteStep::Buffered));
+
+        let mut rest = vec![b'a'; MAX_BRACKETED_PASTE];
+        rest.extend_from_slice(b"tail");
+        let PasteStep::Complete(buf) = paste.feed(&rest) else {
+            panic!("oversized paste should be flushed");
+        };
+        assert_eq!(buf.len(), BRACKETED_PASTE_START.len() + rest.len());
+        assert!(buf.starts_with(BRACKETED_PASTE_START));
+        assert!(buf.ends_with(b"tail"));
+        // The state is cleared, so the next read is treated normally.
+        assert!(matches!(paste.feed(b"x"), PasteStep::PassThrough));
+
+        // Exactly at the limit is still held back; one byte more flushes it.
+        let mut paste = BracketedPaste::default();
+        assert!(matches!(paste.feed(b"\x1b[200~"), PasteStep::Buffered));
+        let exact = vec![b'a'; MAX_BRACKETED_PASTE - BRACKETED_PASTE_START.len()];
+        assert!(matches!(paste.feed(&exact), PasteStep::Buffered));
+        assert!(matches!(paste.feed(b"a"), PasteStep::Complete(_)));
+    }
+
+    #[test]
+    fn bytes_after_end_marker_stay_in_the_completed_paste() {
+        let mut paste = BracketedPaste::default();
+        assert!(matches!(paste.feed(b"\x1b[200~"), PasteStep::Buffered));
+
+        let second = format!("{}\x1b[201~\r\n", OTTY_IMAGE_PATH);
+        let PasteStep::Complete(buf) = paste.feed(second.as_bytes()) else {
+            panic!("paste should complete");
+        };
+        let path = image_paste_path(&buf).expect("path");
+        assert_eq!(path.path, OTTY_IMAGE_PATH);
+        assert_eq!(path.trailing, b"\r\n");
+    }
+
+    #[test]
+    fn completed_paste_resets_for_the_next_one() {
+        let mut paste = BracketedPaste::default();
+        let start = b"\x1b[200~";
+        let body = format!("{}\x1b[201~", OTTY_IMAGE_PATH);
+        for _ in 0..2 {
+            assert!(matches!(paste.feed(start), PasteStep::Buffered));
+            assert!(matches!(
+                paste.feed(body.as_bytes()),
+                PasteStep::Complete(_)
+            ));
+        }
     }
 
     #[test]
