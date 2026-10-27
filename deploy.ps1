@@ -9,10 +9,46 @@
 # Restarting smd kills every hosted session, so it only happens when no sessions
 # exist and -RestartDaemon is passed explicitly. A failed probe of the daemon is
 # never treated as "no sessions".
-param([switch]$RestartDaemon)
+#
+# -Force stops every live session (via the daemon's Stop op, then by killing the
+# daemon's process tree), replaces smd as well, and restarts smd/smw. Because it
+# kills the shell it would be running in, run it from a plain SSH command or a
+# terminal that is not hosted by sm.
+param([switch]$RestartDaemon, [switch]$Force)
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+
+# Whether this script is running inside a shell hosted by an smd process. A
+# forced update would otherwise terminate the shell halfway through the deploy.
+function Test-InsideHostedSession {
+    $current = $PID
+    for ($i = 0; $i -lt 32; $i++) {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
+        if (-not $proc) { return $false }
+        $parent = [int]$proc.ParentProcessId
+        if ($parent -le 0 -or $parent -eq $current) { return $false }
+        $parentProc = Get-CimInstance Win32_Process -Filter "ProcessId=$parent" -ErrorAction SilentlyContinue
+        if (-not $parentProc) { return $false }
+        if ($parentProc.Name -ieq "smd.exe") { return $true }
+        $current = $parent
+    }
+    return $false
+}
+
+function Stop-ProcessTree([int]$Id) {
+    $children = @(
+        Get-CimInstance Win32_Process -Filter "ParentProcessId=$Id" -ErrorAction SilentlyContinue
+    )
+    foreach ($child in $children) {
+        Stop-ProcessTree -Id ([int]$child.ProcessId)
+    }
+    Stop-Process -Id $Id -Force -ErrorAction SilentlyContinue
+}
+
+if ($Force -and (Test-InsideHostedSession)) {
+    throw "deploy.ps1 -Force stops the daemon that hosts this shell. Run it from a plain SSH command or a non-sm terminal."
+}
 
 # The web UI is embedded into smw.exe at compile time. Build it first so the
 # deployed smw serves the real frontend instead of the "not built" placeholder.
@@ -151,6 +187,33 @@ function Get-ProdDaemon {
         try { $path = $_.Path } catch { }
         $path -and ($path -ieq $smd)
     }
+}
+
+# A forced update is allowed even with live sessions: stop them through the
+# daemon first, then kill what remains so no shell is left orphaned.
+if ($Force) {
+    $listed = & $sm list 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        foreach ($line in $listed) {
+            $name = ("$line".Trim() -replace '^\*', '').Trim()
+            if ($name) {
+                & $sm stop $name 2>$null | Out-Null
+            }
+        }
+    } else {
+        Write-Warning "Could not list sessions; killing the daemon process tree."
+    }
+    foreach ($d in @(Get-ProdDaemon)) {
+        Write-Host "Force-stopping daemon pid $($d.Id) and its sessions..."
+        Stop-ProcessTree -Id $d.Id
+        $d | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+    }
+    # Let the scheduler notice the old task instance is gone before re-running it.
+    Start-Sleep -Milliseconds 500
+    Copy-Item "target\release\smd.exe" $smd -Force
+    Start-Daemon
+    Write-Host "All sessions stopped; sm, smd and smw updated and restarted."
+    exit 0
 }
 
 $prodDaemons = @(Get-ProdDaemon)

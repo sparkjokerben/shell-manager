@@ -24,6 +24,20 @@ cargo build --release -p smpaste
 
 The binary is written to `target/release/smpaste` (`smpaste.exe` on Windows).
 
+## Prebuilt binaries
+
+The `smpaste` GitHub Actions workflow builds artifacts for macOS (arm64 and
+x64), Linux (x64 and arm64) and Windows (x64). Download the artifact for your
+platform from the workflow run, extract `smpaste`, then make it executable:
+
+```sh
+chmod +x smpaste
+xattr -d com.apple.quarantine smpaste   # macOS only, for a downloaded binary
+```
+
+The binaries are not code-signed or notarized; macOS may ask you to confirm the
+first launch.
+
 ## Run
 
 ```sh

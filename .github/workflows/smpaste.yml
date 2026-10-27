@@ -1,0 +1,55 @@
+name: smpaste
+
+# Build the standalone clipboard watcher for the SSH client machines.
+# Download the artifact for your platform and run it on the client; the host
+# side is deployed with deploy.ps1.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "smpaste/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/smpaste.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: smpaste-macos-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: smpaste-macos-x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: smpaste-linux-x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: smpaste-linux-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: smpaste-windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p smpaste --target ${{ matrix.target }}
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/smpaste*
+          if-no-files-found: error

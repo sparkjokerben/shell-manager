@@ -63,6 +63,15 @@ cd shell-manager
 when the installed daemon is not running or hosts no sessions; a running daemon
 is restarted only with `-RestartDaemon`, which ends every hosted shell.
 
+`-Force` is the unconditional update: it stops every hosted session, replaces
+`smd.exe` too, and restarts `smd`/`smw`. Because it kills the shell it would be
+running in, invoke it from a plain SSH command or a terminal that is not hosted
+by `sm`:
+
+```powershell
+.\deploy.ps1 -Force
+```
+
 ## Usage
 
 ```text
@@ -94,7 +103,9 @@ machine that runs it. `smpaste` (the small client binary in `smpaste/`) closes
 that gap: it watches the local clipboard and pushes every new image to the host
 over one persistent SSH connection.
 
-On the SSH client:
+On the SSH client, download the artifact for your platform from the `smpaste`
+GitHub Actions run (macOS arm64/x64, Linux x64/arm64, Windows x64), or build it
+yourself:
 
 ```sh
 cargo build --release -p smpaste

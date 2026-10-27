@@ -58,6 +58,14 @@ cd shell-manager
 替换守护进程；要重启正在运行的守护进程必须显式传 `-RestartDaemon`，它会结束所有
 托管的 shell。
 
+`-Force` 是无条件更新：它会先结束所有托管会话，连同 `smd.exe` 一起替换，然后重启
+`smd`/`smw`。因为它会杀掉自己所在的 shell，必须从一条普通 SSH 命令、或不被 `sm`
+托管的终端里执行：
+
+```powershell
+.\deploy.ps1 -Force
+```
+
 ## 用法
 
 ```text
@@ -85,7 +93,8 @@ SSH 只传文本，而 Claude Code 读的是**运行它的那台机器**的剪�
 （`smpaste/` 下的客户端小工具）补上这一环：它监视本机剪贴板，把每张新图片
 通过一条持久 SSH 连接推给主机。
 
-在 SSH 客户端上：
+在 SSH 客户端上，从 `smpaste` 的 GitHub Actions 运行记录里下载对应平台的产物
+（macOS arm64/x64、Linux x64/arm64、Windows x64），也可以自行构建：
 
 ```sh
 cargo build --release -p smpaste
