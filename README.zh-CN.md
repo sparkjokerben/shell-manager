@@ -318,6 +318,10 @@ cargo run --bin sm -- ls # 连接这个开发守护进程
   （`()`/`[]`/`[x]`）。
 - 没有客户端附着时，排空线程持续读取伪终端输出，保证程序不会因管道写满而阻塞。
 - 重新附着时客户端把伪终端高度先减一、再恢复，触发应用整屏重绘。
+- 客户端不接管终端的 alternate screen：需要它的应用（例如 `vim`、Windows 版
+  Claude Code）自行切换，行为与直接 `ssh` 一致；不需要它的应用（例如 WSL 里的
+  Claude Code、普通 shell 提示符）留在主屏幕，因此保留终端滚动历史，滚轮是滚动
+  而不是被转成上下键。代价是脱附后原来的可见屏幕不会被恢复（内容仍在滚动历史里）。
 - shell 选择顺序：非打包版 PowerShell 7（Program Files 或用户级安装）→ `PATH`
   里的 `pwsh.exe` → Microsoft Store 别名 → Windows PowerShell 5.1，逐个尝试，
   取第一个真正能启动的。

@@ -354,6 +354,13 @@ terminal ── sm.exe ──┬── control pipe ──┐
   program writing to the console never blocks.
 - On reattach the client toggles the pseudo-console height (shrink one row, then
   restore) which makes the hosted application redraw its whole screen.
+- The client does not take over the terminal's alternate screen. Applications
+  that want one (`vim`, Claude Code on Windows) switch it themselves, matching a
+  plain SSH session; applications that do not (Claude Code inside WSL, a shell
+  prompt) stay on the primary screen and keep the terminal's scrollback, so the
+  wheel scrolls history instead of being translated into Up/Down keys. The
+  trade-off is that detaching no longer restores the previously visible screen;
+  its content remains in the scrollback.
 - Shell selection prefers an unpackaged PowerShell 7 (`Program Files` or
   per-user install), then `pwsh.exe` from `PATH`, then the Microsoft Store alias,
   then Windows PowerShell 5.1, and tries them in order until one starts.
