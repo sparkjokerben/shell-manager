@@ -401,7 +401,7 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 
 /// Bumped whenever the client's input handling changes, so a stale attach is
 /// easy to spot in the banner.
-const CLIENT_BUILD: &str = "client 2026-10-27a";
+const CLIENT_BUILD: &str = "client 2026-10-27b";
 
 /// Appends a diagnostic line to %TEMP%\sm-client[-<instance>].log.
 ///
@@ -462,8 +462,17 @@ const DETACH_SEQS: &[&[u8]] = &[b"\x1b[24~", b"\x1d"];
 /// leak into the shell as typed garbage.
 const MOUSE_RESET: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
-/// Leave the alternate screen buffer (all historical variants), so teardown
-/// messages land on the normal screen instead of inside the hosted TUI.
+/// Enter the alternate screen buffer for the whole attach.
+///
+/// A shell that is not a TUI makes ConPTY repaint from its home position
+/// (PowerShell starts with `CSI 2 J`, WSL with `CSI H` plus one erase per row),
+/// which would overwrite everything the parent terminal showed before `sm`
+/// started. Keeping the session on the alternate buffer leaves that content
+/// untouched; `LEAVE_ALT_SCREEN` restores it on detach.
+const ENTER_ALT_SCREEN: &[u8] = b"\x1b[?1049h";
+
+/// Leave the alternate screen buffer (all historical variants), restoring the
+/// parent terminal's content and cursor after the attach.
 const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l\x1b[?1047l\x1b[?47l";
 
 /// Show the cursor and reset SGR attributes, restoring a usable local prompt.
@@ -478,13 +487,61 @@ const SHOW_CURSOR_RESET_SGR: &[u8] = b"\x1b[?25h\x1b[0m";
 /// request from the terminal and switches the mode off on every attach.
 const WIN32_INPUT_OFF: &[u8] = b"\x1b[?9001l";
 
-/// Sequence prefix the hosted app uses to enable Win32 input mode.
-const WIN32_INPUT_SEQ: &[u8] = b"\x1b[?9001";
+/// DEC private mode switches the client manages on the local terminal.
+///
+/// 9001 is Win32 input mode: hiding it keeps the terminal sending plain VT
+/// keystrokes. 47/1047/1049 are the alternate-screen variants the client owns
+/// for the whole attach, so a hosted app that enters and leaves its own
+/// alternate screen cannot switch the local terminal underneath the client.
+fn is_client_mode(mode: u32, own_screen: bool) -> bool {
+    match mode {
+        9001 => true,
+        47 | 1047 | 1049 => own_screen,
+        _ => false,
+    }
+}
 
-/// Drop `CSI ? 9001 h|l` from the PTY output so the terminal keeps encoding
-/// input as ordinary VT bytes. A sequence split across reads is held in `carry`
-/// until its final byte arrives.
-fn strip_win32_input_mode(data: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
+/// Remove client-owned modes from one `CSI ? params h|l` parameter list.
+///
+/// Returns `None` when the list contains no client-owned mode, so the sequence
+/// can be forwarded untouched. Otherwise returns the remaining parameters,
+/// which may be empty when every mode in the sequence belongs to the client.
+fn without_client_modes(params: &[u8], own_screen: bool) -> Option<Vec<u8>> {
+    let mut kept: Vec<&[u8]> = Vec::new();
+    let mut removed = false;
+    for field in params.split(|&b| b == b';') {
+        if field.is_empty() {
+            kept.push(field);
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(field) else {
+            return None;
+        };
+        match text.parse::<u32>() {
+            Ok(mode) if is_client_mode(mode, own_screen) => removed = true,
+            _ => kept.push(field),
+        }
+    }
+    if !removed {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (index, field) in kept.iter().enumerate() {
+        if index > 0 {
+            out.push(b';');
+        }
+        out.extend_from_slice(field);
+    }
+    Some(out)
+}
+
+/// Drop the DEC private mode switches the client owns from the PTY output.
+///
+/// Only `CSI ? ... h|l` sequences are inspected; a sequence that also carries
+/// other modes is re-emitted without the owned ones, so the hosted app's mouse
+/// settings still reach the terminal. A sequence split across reads is held in
+/// `carry` until its final byte arrives.
+fn strip_client_modes(data: &[u8], carry: &mut Vec<u8>, own_screen: bool) -> Vec<u8> {
     let mut buf = Vec::with_capacity(carry.len() + data.len());
     buf.extend_from_slice(carry);
     buf.extend_from_slice(data);
@@ -493,27 +550,64 @@ fn strip_win32_input_mode(data: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
     while i < buf.len() {
+        if buf[i] != 0x1b {
+            out.push(buf[i]);
+            i += 1;
+            continue;
+        }
         let rest = &buf[i..];
-        if rest.starts_with(WIN32_INPUT_SEQ) {
-            if rest.len() == WIN32_INPUT_SEQ.len() {
-                // Final byte not seen yet.
-                carry.extend_from_slice(rest);
-                break;
-            }
-            if matches!(rest[WIN32_INPUT_SEQ.len()], b'h' | b'l') {
-                i += WIN32_INPUT_SEQ.len() + 1;
-                continue;
-            }
-        } else if rest.len() >= 2
-            && rest.len() < WIN32_INPUT_SEQ.len()
-            && WIN32_INPUT_SEQ.starts_with(rest)
-        {
-            // Possible prefix of the sequence at the end of this chunk.
+        if rest.len() == 1 {
+            // A trailing ESC is the start of a sequence split across reads. It
+            // has no visible effect on its own, so holding it back cannot delay
+            // any output, and it lets the next read recognise `ESC [` as a
+            // whole - including a sequence that breaks right after the ESC.
             carry.extend_from_slice(rest);
             break;
         }
-        out.push(buf[i]);
-        i += 1;
+        if rest[1] != b'[' {
+            out.push(buf[i]);
+            i += 1;
+            continue;
+        }
+        if rest.len() == 2 || rest[2] != b'?' {
+            // `ESC [ X`: not a DEC private sequence. Hold only the `ESC [` that
+            // may still grow into one.
+            if rest.len() == 2 {
+                carry.extend_from_slice(rest);
+                break;
+            }
+            out.push(buf[i]);
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 3;
+        while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+            j += 1;
+        }
+        if j >= buf.len() {
+            // Final byte not seen yet.
+            carry.extend_from_slice(&buf[i..]);
+            break;
+        }
+        let final_byte = buf[j];
+        if final_byte != b'h' && final_byte != b'l' {
+            out.extend_from_slice(&buf[i..=j]);
+            i = j + 1;
+            continue;
+        }
+        match without_client_modes(&buf[i + 3..j], own_screen) {
+            Some(kept) => {
+                // All-empty parameters carry no meaning; drop the sequence.
+                if kept.iter().any(|b| b.is_ascii_digit()) {
+                    out.extend_from_slice(b"\x1b[?");
+                    out.extend_from_slice(&kept);
+                    out.push(final_byte);
+                }
+            }
+            None => out.extend_from_slice(&buf[i..=j]),
+        }
+        i = j + 1;
     }
     out
 }
@@ -863,9 +957,10 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
         };
         if vt_out_ok {
             // These are VT sequences: written before VT output was enabled they
-            // would show up as literal garbage on screen. Start from a clean
-            // terminal state, then restore the mouse modes the hosted app had
-            // enabled before this client attached.
+            // would show up as literal garbage on screen. Take over the screen
+            // for the whole attach, then restore the mouse modes the hosted app
+            // had enabled before this client attached.
+            let _ = write_all(stdout, ENTER_ALT_SCREEN);
             let _ = write_all(stdout, WIN32_INPUT_OFF);
             let _ = write_all(stdout, MOUSE_RESET);
             if initial_mouse_on {
@@ -1051,8 +1146,9 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
         let mut mouse_state = mouse;
         let mut mouse_on = mouse & 0b111 != 0;
         let mut mouse_carry: Vec<u8> = Vec::new();
-        // Holds a split `CSI ? 9001 h|l` between reads; see strip_win32_input_mode.
+        // Holds a split client-owned mode sequence between reads; see strip_client_modes.
         let mut mode_carry: Vec<u8> = Vec::new();
+        let own_screen = has_console && vt_out_ok;
         loop {
             let mut read: u32 = 0;
             let r = unsafe {
@@ -1121,7 +1217,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
                     };
                     // Keep the terminal out of Win32 input mode, otherwise keys
                     // arrive as CSI reports instead of plain VT bytes.
-                    let data = strip_win32_input_mode(&data, &mut mode_carry);
+                    let data = strip_client_modes(&data, &mut mode_carry, own_screen);
                     if !data.is_empty() {
                         // A cancelled console write must only end this thread,
                         // never panic the process.
@@ -1155,10 +1251,9 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
     // sequence would be printed as literal text.
     if has_console && vt_out_ok {
         let _ = write_all(stdout, MOUSE_RESET);
-        // The hosted TUI may have switched the local terminal to the alternate
-        // screen. Leave it before printing anything: otherwise the detach notice
-        // (and the parent shell prompt) is painted into the frozen TUI screen.
-        // These resets are harmless when no alternate screen was active.
+        // The client held the local terminal on the alternate buffer for the
+        // whole attach. Leaving it restores the parent shell's screen and
+        // cursor, so the detach notice below lands on the normal buffer.
         let _ = write_all(stdout, LEAVE_ALT_SCREEN);
         let _ = write_all(stdout, SHOW_CURSOR_RESET_SGR);
     }
@@ -1170,7 +1265,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_motion, strip_win32_input_mode, DetachDetector, Win32Detach};
+    use super::{filter_motion, strip_client_modes, DetachDetector, Win32Detach};
 
     #[test]
     fn f12_detaches() {
@@ -1273,7 +1368,7 @@ mod tests {
     fn win32_input_mode_request_is_dropped() {
         let mut carry = Vec::new();
         assert_eq!(
-            &strip_win32_input_mode(b"a\x1b[?9001hb", &mut carry)[..],
+            &strip_client_modes(b"a\x1b[?9001hb", &mut carry, true)[..],
             b"ab"
         );
         assert!(carry.is_empty());
@@ -1282,30 +1377,81 @@ mod tests {
     #[test]
     fn win32_input_mode_sequence_split_across_reads() {
         let mut carry = Vec::new();
-        assert_eq!(&strip_win32_input_mode(b"a\x1b[?90", &mut carry)[..], b"a");
-        assert_eq!(&strip_win32_input_mode(b"01hb", &mut carry)[..], b"b");
+        assert_eq!(&strip_client_modes(b"a\x1b[?90", &mut carry, true)[..], b"a");
+        assert_eq!(&strip_client_modes(b"01hb", &mut carry, true)[..], b"b");
         assert!(carry.is_empty());
     }
 
     #[test]
     fn win32_input_mode_sequence_split_at_final_byte() {
         let mut carry = Vec::new();
-        assert_eq!(&strip_win32_input_mode(b"\x1b[?9001", &mut carry)[..], b"");
-        assert_eq!(&strip_win32_input_mode(b"l", &mut carry)[..], b"");
+        assert_eq!(&strip_client_modes(b"\x1b[?9001", &mut carry, true)[..], b"");
+        assert_eq!(&strip_client_modes(b"l", &mut carry, true)[..], b"");
         assert!(carry.is_empty());
     }
 
     #[test]
     fn other_private_modes_survive_stripping() {
         let mut carry = Vec::new();
-        let out = strip_win32_input_mode(b"\x1b[?1003h\x1b[?9001l\x1b[?25l", &mut carry);
+        let out = strip_client_modes(b"\x1b[?1003h\x1b[?9001l\x1b[?25l", &mut carry, true);
         assert_eq!(&out[..], b"\x1b[?1003h\x1b[?25l");
     }
 
     #[test]
-    fn trailing_escape_survives_stripping() {
+    fn trailing_escape_is_held_for_the_next_read() {
         let mut carry = Vec::new();
-        assert_eq!(&strip_win32_input_mode(b"x\x1b", &mut carry)[..], b"x\x1b");
+        assert_eq!(&strip_client_modes(b"x\x1b", &mut carry, true)[..], b"x");
+        assert_eq!(&carry[..], b"\x1b");
+        // The held ESC lets the filter see the sequence as a whole even when
+        // the read boundary falls right after it.
+        assert_eq!(&strip_client_modes(b"[?1049hy", &mut carry, true)[..], b"y");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn alt_screen_switches_are_dropped_while_the_client_owns_the_screen() {
+        let mut carry = Vec::new();
+        let out = strip_client_modes(
+            b"a\x1b[?1049hb\x1b[?1049lc\x1b[?1047h\x1b[?47l",
+            &mut carry,
+            true,
+        );
+        assert_eq!(&out[..], b"abc");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn alt_screen_switches_pass_through_without_a_console() {
+        let mut carry = Vec::new();
+        let data = b"a\x1b[?1049hb\x1b[?1049l";
+        let out = strip_client_modes(data, &mut carry, false);
+        assert_eq!(&out[..], data);
+    }
+
+    #[test]
+    fn mixed_sequences_keep_modes_the_client_does_not_own() {
+        let mut carry = Vec::new();
+        let out = strip_client_modes(b"\x1b[?1049;1000h\x1b[?1002;47l", &mut carry, true);
+        assert_eq!(&out[..], b"\x1b[?1000h\x1b[?1002l");
+    }
+
+    #[test]
+    fn alt_screen_sequence_split_across_reads_is_dropped() {
+        let seq = b"x\x1b[?1049hy";
+        for split in 0..=seq.len() {
+            let mut carry = Vec::new();
+            let mut out = strip_client_modes(&seq[..split], &mut carry, true);
+            out.extend_from_slice(&strip_client_modes(&seq[split..], &mut carry, true));
+            assert_eq!(&out[..], b"xy", "split at byte {}", split);
+        }
+    }
+
+    #[test]
+    fn non_private_sequences_are_untouched() {
+        let mut carry = Vec::new();
+        let data = b"\x1b[1;2H\x1b[?1;2c\x1b[1049h";
+        let out = strip_client_modes(data, &mut carry, true);
+        assert_eq!(&out[..], data);
         assert!(carry.is_empty());
     }
 
