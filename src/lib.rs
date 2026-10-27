@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod daemon;
 pub mod log;
 pub mod pty;

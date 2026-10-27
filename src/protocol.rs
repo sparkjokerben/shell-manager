@@ -203,6 +203,8 @@ pub enum Op {
     Detach,
     /// Name of the session used most recently, for bare `sm` invocations.
     Last,
+    /// Put the image staged by the client's paste watcher on the clipboard.
+    PasteImage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

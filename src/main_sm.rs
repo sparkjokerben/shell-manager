@@ -1,8 +1,9 @@
 use std::os::windows::ffi::OsStrExt;
 use std::ffi::OsStr;
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_MODE, OPEN_EXISTING, SECURITY_IDENTIFICATION,
@@ -29,7 +30,9 @@ usage: sm [name]          attach to <name>, creating it if needed
        sm detach [name]   disconnect the attached client, keep the shell
        sm stop [name]     destroy the session and its shell
        sm ls              list sessions
+       sm clipboard-image [--stream]  stage a BMP frame from stdin for paste
 options: --wsl  create the session with wsl.exe instead of PowerShell
+         --stream  keep reading frames until stdin reaches EOF (clipboard-image)
 environment: SM_INSTANCE  use an isolated namespace for pipes, mutex and logs
                           (1-32 chars of A-Z a-z 0-9 - _; default: prod, or dev
                           when the executable runs under target/)";
@@ -45,11 +48,27 @@ enum Cmd {
     Detach { name: Option<String> },
     Stop { name: Option<String> },
     List,
+    /// Stage a BMP frame received on stdin for the image-paste bridge.
+    ClipboardImage { stream: bool },
     Help,
     Version,
 }
 
 fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
+    // The paste bridge runs this as a separate SSH command, before any session
+    // name is involved. It is resolved first so `--stream` is a legal option
+    // here while still being rejected everywhere else.
+    if args.first().map(String::as_str) == Some("clipboard-image") {
+        let mut stream = false;
+        for arg in &args[1..] {
+            match arg.as_str() {
+                "--stream" => stream = true,
+                other => return Err(format!("unknown option: {}", other)),
+            }
+        }
+        return Ok(Cmd::ClipboardImage { stream });
+    }
+
     let mut wsl = false;
     let mut words: Vec<&str> = Vec::with_capacity(args.len());
     for arg in args {
@@ -152,7 +171,89 @@ fn main() -> Result<()> {
             println!("stopped");
             Ok(())
         }
+        Cmd::ClipboardImage { stream } => clipboard_image(stream),
     }
+}
+
+/// Upper bound on one staged frame (64 MiB).
+const MAX_PASTE_FRAME: usize = 64 * 1024 * 1024;
+
+/// Read frames from stdin (4-byte big-endian length + BMP) and stage the latest
+/// one for the daemon to publish on the clipboard.
+///
+/// Runs in its own SSH session and never talks to the daemon: it only writes
+/// the shared staging file, which `Op::PasteImage` later reads.
+fn clipboard_image(stream: bool) -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    loop {
+        let Some(frame) = read_paste_frame(&mut input)? else {
+            if stream {
+                return Ok(());
+            }
+            anyhow::bail!("no image frame received on stdin");
+        };
+        write_staged_image(&frame)?;
+        if !stream {
+            return Ok(());
+        }
+    }
+}
+
+/// Read one length-prefixed frame. `Ok(None)` means a clean EOF before a new
+/// frame started.
+fn read_paste_frame<R: Read>(input: &mut R) -> Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    let mut filled = 0;
+    while filled < len_buf.len() {
+        match input.read(&mut len_buf[filled..]) {
+            Ok(0) if filled == 0 => return Ok(None),
+            Ok(0) => anyhow::bail!("truncated frame length on stdin"),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("failed to read frame length from stdin"),
+        }
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_PASTE_FRAME {
+        anyhow::bail!(
+            "paste frame too large: {} bytes (limit {} bytes)",
+            len,
+            MAX_PASTE_FRAME
+        );
+    }
+    if len == 0 {
+        anyhow::bail!("empty paste frame");
+    }
+
+    let mut frame = vec![0u8; len];
+    input
+        .read_exact(&mut frame)
+        .context("failed to read paste frame body from stdin")?;
+    Ok(Some(frame))
+}
+
+/// Validate a frame and replace the staging file atomically.
+fn write_staged_image(frame: &[u8]) -> Result<()> {
+    if frame.len() < 2 || &frame[0..2] != b"BM" {
+        anyhow::bail!("paste frame is not a BMP");
+    }
+    let path = shell_manager::clipboard::stage_path();
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid staging path"))?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create staging directory {}", dir.display()))?;
+
+    // Write beside the target and rename: the daemon then never reads a
+    // half-written image.
+    let tmp = dir.join(format!("latest.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, frame)
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
 }
 
 fn request(op: Op, name: &str) -> Result<protocol::Response> {
@@ -449,6 +550,26 @@ fn client_log(msg: &str) {
             }
         }
     }
+}
+
+/// Ctrl+' — Otty sends it as 0x1c (the FS control byte; Ctrl+\ produces the
+/// same byte on a standard keyboard). It asks the daemon to publish the
+/// client-staged image and then injects the app-level paste key; it is never
+/// forwarded to the hosted program.
+const PASTE_TRIGGER: u8 = 0x1c;
+
+/// Claude Code's image-paste key on Windows (Alt+V, sent as ESC v).
+const PASTE_KEY: &[u8] = b"\x1bv";
+
+/// Split forwarded input on the image-paste trigger, dropping each trigger
+/// byte. Every gap between segments means "paste the staged image".
+fn split_paste_triggers(data: &[u8]) -> Vec<&[u8]> {
+    data.split(|&b| b == PASTE_TRIGGER).collect()
+}
+
+/// Drop trigger bytes without acting on them (used when detach wins).
+fn strip_paste_triggers(data: &[u8]) -> Vec<u8> {
+    data.iter().copied().filter(|&b| b != PASTE_TRIGGER).collect()
 }
 
 /// Detach triggers. The printable sequence works from any keyboard and is not
@@ -1054,6 +1175,7 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
 
     let stdin_done = reader_done.clone();
     let stdin_reader_tid = reader_tid.clone();
+    let paste_name = name.to_string();
 
     let stdin_thread = std::thread::spawn(move || -> Result<()> {
         let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE)? };
@@ -1107,17 +1229,57 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
                             "detach matched (win32 report)"
                         });
                         // Forward whatever preceded the key on this read before
-                        // tearing the connection down.
-                        if !forward.is_empty() {
-                            let _ = write_all(h_in, &forward);
+                        // tearing the connection down. Detach wins over image
+                        // paste, so any trigger in the prefix is dropped rather
+                        // than acted on or forwarded.
+                        let prefix = strip_paste_triggers(&forward);
+                        if !prefix.is_empty() {
+                            let _ = write_all(h_in, &prefix);
                         }
                         // Unblock the reader thread's ReadFile on the out pipe.
                         stop_reader(&stdin_reader_tid, &stdin_done);
                         break;
                     }
-                    if !forward.is_empty() && !write_all(h_in, &forward)? {
-                        client_log("stdin forward failed");
-                        return Ok(());
+                    // Ctrl+' arrives as the raw 0x1c byte. The Win32-input-mode
+                    // report path above is deliberately not used for image
+                    // paste: Otty (the paste bridge's terminal) does not
+                    // implement CSI ? 9001 h, so keys are never encoded as
+                    // reports.
+                    let parts = split_paste_triggers(&forward);
+                    for (index, part) in parts.iter().enumerate() {
+                        if !part.is_empty() && !write_all(h_in, part)? {
+                            client_log("stdin forward failed");
+                            return Ok(());
+                        }
+                        // A gap means a trigger was removed between `part` and
+                        // the next segment. A single read may contain several.
+                        if index + 1 < parts.len() {
+                            client_log("image paste triggered");
+                            let req = Request {
+                                op: Op::PasteImage,
+                                name: paste_name.clone(),
+                                wsl: None,
+                                cols: None,
+                                rows: None,
+                            };
+                            match protocol::pipe_request(protocol::control_pipe(), &req) {
+                                Ok(resp) if resp.ok => {}
+                                Ok(resp) => {
+                                    client_log(&format!("image paste failed: {}", resp.error))
+                                }
+                                Err(e) => client_log(&format!(
+                                    "image paste request failed: {:#}",
+                                    e
+                                )),
+                            }
+                            // Inject the app-level paste key even when the
+                            // clipboard update failed, so the failure stays
+                            // visible instead of swallowing the keystroke.
+                            if !write_all(h_in, PASTE_KEY)? {
+                                client_log("stdin forward failed");
+                                return Ok(());
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -1265,7 +1427,11 @@ fn attach(name: &str, pipe_out: &str, pipe_in: &str, mouse: u8, repaint: bool) -
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_motion, strip_client_modes, DetachDetector, Win32Detach};
+    use super::{
+        filter_motion, read_paste_frame, split_paste_triggers, strip_paste_triggers,
+        strip_client_modes, DetachDetector, Win32Detach,
+    };
+    use std::io::Cursor;
 
     #[test]
     fn f12_detaches() {
@@ -1490,6 +1656,62 @@ mod tests {
         assert!(!d.feed(head));
         assert!(d.feed(tail));
     }
+
+    #[test]
+    fn paste_trigger_splits_promptly() {
+        // No trigger: the whole input is one forwardable segment.
+        assert_eq!(split_paste_triggers(b"abc"), vec![&b"abc"[..]]);
+        // One trigger separates the prefix from the suffix.
+        assert_eq!(
+            split_paste_triggers(b"ab\x1ccd"),
+            vec![&b"ab"[..], &b"cd"[..]]
+        );
+        // Several triggers in one read, including back-to-back ones.
+        assert_eq!(
+            split_paste_triggers(b"\x1c\x1c"),
+            vec![&b""[..], &b""[..], &b""[..]]
+        );
+        // A trigger at the very end leaves an empty segment after it.
+        assert_eq!(
+            split_paste_triggers(b"x\x1c"),
+            vec![&b"x"[..], &b""[..]]
+        );
+    }
+
+    #[test]
+    fn detach_prefix_drops_paste_triggers() {
+        assert_eq!(strip_paste_triggers(b"a\x1cb\x1c"), b"ab");
+        assert_eq!(strip_paste_triggers(b"abc"), b"abc");
+    }
+
+    #[test]
+    fn paste_trigger_is_not_forwarded_after_detach_detection() {
+        // Ctrl+' before an F12 is dropped with the rest of the prefix; detach
+        // still wins.
+        let mut d = DetachDetector::new();
+        let (forward, detach) = d.feed(b"a\x1cb\x1b[24~");
+        assert!(detach);
+        assert_eq!(strip_paste_triggers(&forward), b"ab");
+    }
+
+    #[test]
+    fn read_paste_frame_handles_one_frame_and_eof() {
+        let mut input = Cursor::new(b"\x00\x00\x00\x05BMabc".to_vec());
+        let frame = read_paste_frame(&mut input).unwrap().expect("one frame");
+        assert_eq!(frame, b"BMabc");
+        assert!(read_paste_frame(&mut input).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_paste_frame_rejects_truncated_and_oversized_frames() {
+        // Announces five bytes but only three follow.
+        let mut input = Cursor::new(b"\x00\x00\x00\x05BMa".to_vec());
+        assert!(read_paste_frame(&mut input).is_err());
+
+        // Above the 64 MiB cap, rejected before allocating.
+        let mut input = Cursor::new((65u32 * 1024 * 1024).to_be_bytes().to_vec());
+        assert!(read_paste_frame(&mut input).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1611,5 +1833,23 @@ mod cli_tests {
                 wsl: false
             }
         );
+    }
+
+    #[test]
+    fn clipboard_image_is_parsed_before_session_names() {
+        assert_eq!(
+            parse(&args(&["clipboard-image"])).unwrap(),
+            Cmd::ClipboardImage { stream: false }
+        );
+        assert_eq!(
+            parse(&args(&["clipboard-image", "--stream"])).unwrap(),
+            Cmd::ClipboardImage { stream: true }
+        );
+    }
+
+    #[test]
+    fn clipboard_image_rejects_other_arguments() {
+        assert!(parse(&args(&["clipboard-image", "--wsl"])).is_err());
+        assert!(parse(&args(&["clipboard-image", "name"])).is_err());
     }
 }

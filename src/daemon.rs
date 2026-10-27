@@ -170,6 +170,22 @@ fn dispatch(req: &Request, sessions: &SessionTable, last: &LastSession) -> Respo
         Op::Resize => handle_resize(&req.name, req.cols, req.rows, sessions),
         Op::Detach => handle_detach(&req.name, sessions),
         Op::Last => handle_last(last),
+        Op::PasteImage => handle_paste_image(),
+    }
+}
+
+/// Publish the client-staged image on the clipboard.
+fn handle_paste_image() -> Response {
+    match crate::clipboard::install_latest_image() {
+        Ok(()) => {
+            crate::log::info("paste image installed into clipboard");
+            Response::ok(None)
+        }
+        Err(e) => {
+            let msg = format!("failed to install clipboard image: {:#}", e);
+            crate::log::info(&msg);
+            Response::err(msg)
+        }
     }
 }
 

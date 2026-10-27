@@ -1,0 +1,11 @@
+[package]
+name = "smpaste"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Push clipboard images from a client machine to a shell-manager host over SSH"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+arboard = "3"

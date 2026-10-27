@@ -79,6 +79,29 @@ sm start <名字> --wsl      # 只新建（已存在则报错），托管 wsl.ex
 进程在没有客户端时仍持续排空伪终端输出，程序不会因为输出管道写满而卡死；重新
 附着时客户端会让应用整屏重绘。
 
+## 从 SSH 客户端粘贴图片
+
+SSH 只传文本，而 Claude Code 读的是**运行它的那台机器**的剪贴板。`smpaste`
+（`smpaste/` 下的客户端小工具）补上这一环：它监视本机剪贴板，把每张新图片
+通过一条持久 SSH 连接推给主机。
+
+在 SSH 客户端上：
+
+```sh
+cargo build --release -p smpaste
+smpaste --ssh-host <你的 SSH 别名>
+```
+
+主机把最新图片暂存在 `%TEMP%\shell-manager-paste\latest.bmp`。在附着的 `sm`
+会话里按 `Ctrl+'`（终端发送的是 `0x1c`；很多键盘上 `Ctrl+\` 也是同一个字节）。
+`sm` 让守护进程把最新图片以 `CF_DIB` 写进 Windows 剪贴板，再向 Claude Code
+发送它原本的图片粘贴键，于是图片以 `[Image #N]` 附件出现，而不是路径。
+守护进程和 Claude Code 必须在同一个 Windows 交互会话里；按下快捷键前，
+客户端 watcher 需要已经把图片送到主机。
+
+watcher 会转发**所有**剪贴板图片，不只是打算给主机的那些。只在你愿意发送
+这些数据的客户端上运行。自启示例和 SSH 免交互认证见 `smpaste/README.md`。
+
 ## 网页终端（Web UI）
 
 `smw` 是可选的第三个二进制，在同一个守护进程之上提供浏览器终端：

@@ -87,6 +87,32 @@ Claude Code), it keeps running: the daemon keeps draining the pseudo console so
 the program never blocks on a full output pipe, and a reattach repaints the
 whole screen.
 
+## Pasting images from an SSH client
+
+SSH carries text only, and Claude Code reads images from the clipboard of the
+machine that runs it. `smpaste` (the small client binary in `smpaste/`) closes
+that gap: it watches the local clipboard and pushes every new image to the host
+over one persistent SSH connection.
+
+On the SSH client:
+
+```sh
+cargo build --release -p smpaste
+smpaste --ssh-host <your-ssh-alias>
+```
+
+The host stages the newest image in `%TEMP%\shell-manager-paste\latest.bmp`.
+Inside an attached `sm` session press `Ctrl+'` (sent as `0x1c`; `Ctrl+\` on many
+keyboards). `sm` asks the daemon to publish the staged image on the Windows
+clipboard as `CF_DIB`, then sends Claude Code its normal image-paste key, so the
+image becomes an `[Image #N]` attachment instead of a path. The daemon and
+Claude Code must run in the same interactive Windows session, and the watcher
+must already have delivered the image.
+
+The watcher forwards **every** clipboard image, not only the ones intended for
+the host. Run it only on a client you are comfortable sending that data from.
+Autostart examples and SSH authentication notes are in `smpaste/README.md`.
+
 ## Web UI
 
 `smw` is an optional third binary that puts a terminal in the browser on top of

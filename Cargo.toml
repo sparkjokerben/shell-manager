@@ -35,6 +35,8 @@ windows = { version = "0.52", features = [
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -45,3 +47,7 @@ axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 futures-util = "0.3"
 include_dir = "0.7"
+
+[workspace]
+members = ["smpaste"]
+resolver = "2"
