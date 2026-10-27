@@ -45,6 +45,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Test
+        run: cargo test --locked -p smpaste --target ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked -p smpaste --target ${{ matrix.target }}
       - name: Upload

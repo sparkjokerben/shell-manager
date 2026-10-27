@@ -91,15 +91,21 @@ sm start <名字> --wsl      # 只新建（已存在则报错），托管 wsl.ex
 
 SSH 只传文本，而 Claude Code 读的是**运行它的那台机器**的剪贴板。`smpaste`
 （`smpaste/` 下的客户端小工具）补上这一环：它监视本机剪贴板，把每张新图片
-通过一条持久 SSH 连接推给主机。
+通过持久 SSH 连接推给发现到的主机。默认情况下它会扫描本机的进程列表，自动
+发现你打开的交互式 `ssh` 会话，所以直接启动即可；传入 `--ssh-host <别名>`
+则固定只推给这一台主机。
 
 在 SSH 客户端上，从 `smpaste` 的 GitHub Actions 运行记录里下载对应平台的产物
 （macOS arm64/x64、Linux x64/arm64、Windows x64），也可以自行构建：
 
 ```sh
 cargo build --release -p smpaste
-smpaste --ssh-host <你的 SSH 别名>
+smpaste
 ```
+
+若只想推给某一台主机，运行 `smpaste --ssh-host <你的 SSH 别名>`；自动发现的
+扫描间隔可用 `--scan-ms` 调整（默认 5000ms）。自动发现仅在 macOS 和 Linux 上
+可用；Windows 必须显式传 `--ssh-host`。
 
 主机把最新图片暂存在 `%TEMP%\shell-manager-paste\latest.bmp`。
 
@@ -119,7 +125,8 @@ Claude Code 发送它原本的图片粘贴键，于是图片以 `[Image #N]` 附
 客户端 watcher 需要已经把图片送到主机。
 
 watcher 会转发**所有**剪贴板图片，不只是打算给主机的那些。只在你愿意发送
-这些数据的客户端上运行。自启示例和 SSH 免交互认证见 `smpaste/README.md`。
+这些数据的客户端上运行。为了发现 SSH 会话，它还会读取本机的进程列表。自启
+示例和 SSH 免交互认证见 `smpaste/README.md`。
 
 ## 网页终端（Web UI）
 

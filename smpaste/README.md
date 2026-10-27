@@ -2,13 +2,20 @@
 
 `smpaste` is a small resident client for shell-manager. It watches the local
 clipboard (macOS, Linux, or Windows), and every time a new image appears it
-pushes that image to a shell-manager host over one persistent SSH connection.
-The host is expected to run `sm clipboard-image --stream`.
+pushes that image to one or more shell-manager hosts over persistent SSH
+connections. Each host is expected to run `sm clipboard-image --stream`.
+
+By default `smpaste` discovers the hosts itself: it scans the process list for
+interactive `ssh` sessions and keeps one stream per host. Pass
+`--ssh-host <alias>` to forward to a single fixed host instead.
 
 Each image is sent as one frame: a 4-byte big-endian length followed by a
 32-bit, bottom-up, BGRA BMP (at most 64 MiB). Images are only sent when their
-content changes. After an SSH failure the client reconnects every two seconds
-and replays the last image once.
+content changes. After an SSH failure the client retries with a short backoff
+(two seconds, doubling up to 60 seconds for discovered hosts) and replays the
+last image once when the stream comes back. Discovered hosts are rescanned
+every five seconds; a host that appears later immediately receives the most
+recent image.
 
 On Windows and macOS the watcher first checks the platform clipboard change
 counter and only reads image data after the clipboard actually changed. This
@@ -46,24 +53,63 @@ first launch.
 ## Run
 
 ```sh
-smpaste --ssh-host my-server
+smpaste                                          # discover interactive ssh sessions
+smpaste --ssh-host my-server                     # forward to one host only
 smpaste --ssh-host user@example.com --remote-sm /usr/local/bin/sm --interval-ms 200
 ```
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--ssh-host <alias>` | required | Host alias from `~/.ssh/config`, or `user@host` |
+| `--ssh-host <alias>` | discovery | Host alias from `~/.ssh/config`, or `user@host`. When given, only that host is used and no scanning happens. |
 | `--remote-sm <command>` | `sm` | Remote shell-manager command |
 | `--interval-ms <ms>` | `200` | Clipboard poll interval |
+| `--scan-ms <ms>` | `5000` | Process-list scan interval (only used by automatic discovery) |
 
-Logs are written to stderr. The process starts
-`ssh -T <ssh-host> <remote-sm> clipboard-image --stream`, keeps its stdin open,
-and exits normally if killed.
+Logs are written to stderr. For each host the process starts
+`ssh -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -C -T
+<destination> <remote-sm> clipboard-image --stream`, keeps its stdin open, and
+exits normally if killed.
+
+## Automatic host discovery
+
+Without `--ssh-host`, `smpaste` runs `ps` every `--scan-ms` (five seconds by
+default) and parses the command line of each process. A process is treated as
+an interactive SSH session when:
+
+- the executable's basename is exactly `ssh`;
+- it has a destination and **no remote command**, so `git` over SSH, `scp`,
+  VS Code Remote, and smpaste's own `clipboard-image --stream` connections are
+  ignored;
+- it does not use `-T`, `-N`, `-W`, `-D`, `-n`, `-f`, or another
+  non-interactive or forwarding option.
+
+The destination (`user@host` or an alias from `~/.ssh/config`) and the
+connection options that matter (`-F`, `-i`, `-J`, `-l`, `-p`, `-S`, and
+non-conflicting `-o` settings) are reused for the clipboard stream. Local,
+remote, and dynamic forwards are deliberately dropped: a new connection that
+binds the same ports again would fail.
+
+Every discovered host gets its own stream. A host that disappears is closed;
+one that appears later is connected and immediately receives the newest image.
+Discovery looks at the machine's process list, so run `smpaste` as the same
+user whose `ssh` sessions you want it to follow; other users' sessions are not
+something it can authenticate as.
+
+Limitations:
+
+- Only standalone `ssh` processes are visible. SSH support built into Otty and
+  `mosh` sessions are not.
+- Every discovered host must accept non-interactive authentication (see
+  below), because the clipboard stream has no terminal.
+- Automatic discovery is available on macOS and Linux only. On Windows pass
+  `--ssh-host <alias>`.
 
 ## SSH authentication
 
 The stream must start without any interactive prompt (there is no terminal
-attached to the remote command). Use key-based authentication and verify it:
+attached to the remote command). Use key-based authentication and verify it on
+every host you want to forward to, including hosts found by automatic
+discovery:
 
 ```sh
 ssh-keygen -t ed25519            # if you do not have a key yet
@@ -99,8 +145,6 @@ Create `~/Library/LaunchAgents/io.github.smpaste.plist`:
     <key>ProgramArguments</key>
     <array>
         <string>/Users/you/.cargo/bin/smpaste</string>
-        <string>--ssh-host</string>
-        <string>my-server</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -118,6 +162,9 @@ Create `~/Library/LaunchAgents/io.github.smpaste.plist`:
 launchctl load -w ~/Library/LaunchAgents/io.github.smpaste.plist
 ```
 
+Add `--ssh-host my-server` to the `ProgramArguments` array to pin a single
+host instead of using discovery.
+
 Launch agents run in the logged-in user's GUI session. If clipboard reads are
 blocked by the OS privacy controls on your macOS version, run `smpaste`
 once from Terminal to see the prompt, or grant the hosting app the requested
@@ -133,7 +180,7 @@ Description=Forward clipboard images to shell-manager
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/.cargo/bin/smpaste --ssh-host my-server
+ExecStart=%h/.cargo/bin/smpaste
 Restart=always
 RestartSec=2
 
@@ -147,6 +194,9 @@ systemctl --user enable --now smpaste
 journalctl --user -u smpaste -f
 ```
 
+Add `--ssh-host my-server` to `ExecStart` to pin a single host instead of
+using discovery.
+
 The service needs access to the graphical session (`DISPLAY` or
 `WAYLAND_DISPLAY`). On Wayland compositors that do not expose images through
 the default X11 path, rebuild with arboard's data-control feature:
@@ -158,4 +208,5 @@ cargo build --release -p smpaste --features arboard/wayland-data-control
 ### Windows
 
 Run `smpaste.exe` at login from Task Scheduler, or place a shortcut in
-`shell:startup`. No clipboard permission is normally required.
+`shell:startup`. No clipboard permission is normally required. Automatic host
+discovery is not available on Windows, so pass `--ssh-host <alias>`.

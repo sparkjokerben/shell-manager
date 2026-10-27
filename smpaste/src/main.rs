@@ -1,17 +1,25 @@
-//! smpaste: forward clipboard images to a shell-manager host over SSH.
+//! smpaste: forward clipboard images to shell-manager hosts over SSH.
 //!
 //! The process polls the local clipboard, encodes every new image as a
 //! 32-bit bottom-up BMP, and writes it to a persistent remote
 //! `sm clipboard-image --stream` process using a simple length-prefixed
 //! framing (4-byte big-endian length followed by the BMP bytes).
+//!
+//! With `--ssh-host` it forwards to exactly that host. Without it the process
+//! periodically scans for interactive `ssh` sessions and keeps one stream per
+//! discovered host.
 
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use arboard::{Clipboard, Error as ClipboardError, ImageData};
+
+mod discover;
+
+use crate::discover::SshTarget;
 
 /// BMP file header (14 bytes) plus BITMAPINFOHEADER (40 bytes).
 const BMP_PIXEL_OFFSET: usize = 14 + 40;
@@ -19,8 +27,12 @@ const BMP_PIXEL_OFFSET: usize = 14 + 40;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// Delay before trying to start a new SSH stream after a failure.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// Upper bound for the exponential backoff of discovered hosts.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 /// Default clipboard poll interval.
 const DEFAULT_INTERVAL_MS: u64 = 200;
+/// Default interval between process-list scans for interactive SSH sessions.
+const DEFAULT_SCAN_MS: u64 = 5000;
 const DEFAULT_REMOTE_SM: &str = "sm";
 /// Pixels per meter resolution stored in the BMP info header (72 DPI).
 const PIXELS_PER_METER: i32 = 2835;
@@ -61,16 +73,22 @@ const USAGE: &str = concat!(
     "Forward clipboard images to a shell-manager host over SSH.\n",
     "\n",
     "Usage:\n",
-    "  smpaste --ssh-host <alias> [--remote-sm <command>] [--interval-ms <ms>]\n",
+    "  smpaste [--ssh-host <alias>] [--remote-sm <command>] [--interval-ms <ms>] [--scan-ms <ms>]\n",
     "\n",
     "Options:\n",
-    "  --ssh-host <alias>     SSH host alias or user@host (required)\n",
+    "  --ssh-host <alias>     SSH host alias or user@host; fixes a single host\n",
+    "                         (default: discover interactive ssh sessions)\n",
     "  --remote-sm <command>  Remote shell-manager command (default: sm)\n",
     "  --interval-ms <ms>     Clipboard poll interval in milliseconds (default: 200)\n",
+    "  --scan-ms <ms>         SSH discovery interval in milliseconds (default: 5000)\n",
     "  -h, --help             Print this help and exit\n",
     "\n",
-    "The process keeps one SSH connection open and sends one length-prefixed\n",
-    "BMP frame per clipboard image. It reconnects automatically after failures.\n",
+    "Without --ssh-host the process scans for interactive ssh sessions every\n",
+    "--scan-ms, keeps one stream per host, and sends the newest clipboard image\n",
+    "to every connected host. Automatic discovery is not available on Windows.\n",
+    "\n",
+    "Each image is sent as one length-prefixed BMP frame; the process reconnects\n",
+    "automatically after failures.\n",
 );
 
 fn main() {
@@ -92,11 +110,16 @@ fn real_main() -> Result<()> {
 
 #[derive(Debug)]
 struct Options {
-    ssh_host: String,
+    /// `None` means automatic discovery.
+    ssh_host: Option<String>,
     remote_sm: String,
     interval: Duration,
+    /// How often to rescan for interactive SSH sessions. Only used when
+    /// `ssh_host` is `None`.
+    scan: Duration,
 }
 
+#[derive(Debug)]
 enum Cli {
     Help,
     Run(Options),
@@ -113,6 +136,7 @@ where
     let mut ssh_host: Option<String> = None;
     let mut remote_sm: Option<String> = None;
     let mut interval_ms = DEFAULT_INTERVAL_MS;
+    let mut scan_ms = DEFAULT_SCAN_MS;
 
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -137,14 +161,23 @@ where
                     bail!("--interval-ms must be greater than zero");
                 }
             }
+            "--scan-ms" => {
+                let value = take_value("--scan-ms", inline, &mut args)?;
+                scan_ms = value
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid --scan-ms value {value:?}"))?;
+                if scan_ms == 0 {
+                    bail!("--scan-ms must be greater than zero");
+                }
+            }
             _ => bail!("unknown argument {arg:?}\n\n{USAGE}"),
         }
     }
 
-    let ssh_host =
-        ssh_host.ok_or_else(|| anyhow!("missing required --ssh-host <alias>\n\n{USAGE}"))?;
-    if ssh_host.is_empty() {
-        bail!("--ssh-host must not be empty");
+    if let Some(host) = ssh_host.as_deref() {
+        if host.is_empty() {
+            bail!("--ssh-host must not be empty");
+        }
     }
 
     let remote_sm = remote_sm.unwrap_or_else(|| DEFAULT_REMOTE_SM.to_string());
@@ -156,6 +189,7 @@ where
         ssh_host,
         remote_sm,
         interval: Duration::from_millis(interval_ms),
+        scan: Duration::from_millis(scan_ms),
     }))
 }
 
@@ -172,14 +206,26 @@ fn take_value(
     }
 }
 
-/// Watch the clipboard and keep a remote stream alive.
+/// Watch the clipboard and keep a remote stream alive per host.
 fn run(opts: Options) -> Result<()> {
-    eprintln!(
-        "smpaste: polling clipboard every {} ms; forwarding to `ssh -T {} {} clipboard-image --stream`",
-        opts.interval.as_millis(),
-        opts.ssh_host,
-        opts.remote_sm
-    );
+    if opts.ssh_host.is_none() && cfg!(windows) {
+        bail!(
+            "automatic SSH host discovery is not available on Windows; pass --ssh-host <alias>"
+        );
+    }
+
+    match opts.ssh_host.as_deref() {
+        Some(host) => eprintln!(
+            "smpaste: polling clipboard every {} ms; forwarding to `ssh -T {host} {} clipboard-image --stream`",
+            opts.interval.as_millis(),
+            opts.remote_sm
+        ),
+        None => eprintln!(
+            "smpaste: polling clipboard every {} ms; discovering SSH hosts every {} ms",
+            opts.interval.as_millis(),
+            opts.scan.as_millis()
+        ),
+    }
 
     let mut clipboard = Clipboard::new().context("failed to open the system clipboard")?;
     let mut watcher = ClipboardWatcher::default();
@@ -213,68 +259,48 @@ fn run(opts: Options) -> Result<()> {
         }
     }
 
-    let mut connection: Option<Connection> = None;
+    let mut streams: Vec<Stream> = Vec::new();
+    if let Some(host) = opts.ssh_host.as_deref() {
+        streams.push(Stream::new(
+            SshTarget {
+                destination: host.to_string(),
+                carried: Vec::new(),
+            },
+            true,
+            Instant::now(),
+        ));
+    }
+    let mut next_scan = Instant::now();
+    let mut last_scan_error: Option<String> = None;
 
     loop {
-        // Establish a new stream if we do not have one. After a reconnect the
-        // last successfully encoded image is replayed once.
-        if connection.is_none() {
-            match Connection::connect(&opts) {
-                Ok(mut conn) => {
-                    eprintln!("smpaste: ssh stream started");
-                    let replay_ok = match last_bmp.as_deref() {
-                        Some(bmp) => match conn.send(bmp) {
-                            Ok(bytes) => {
-                                eprintln!("smpaste: replayed last image ({bytes} frame bytes)");
-                                true
-                            }
-                            Err(err) => {
-                                eprintln!("smpaste: replaying last image failed: {err:#}");
-                                false
-                            }
-                        },
-                        None => true,
-                    };
-                    if replay_ok {
-                        connection = Some(conn);
-                    }
+        let now = Instant::now();
+
+        // Discover interactive SSH sessions. A failed scan keeps the existing
+        // streams alive and only reports a changed error message.
+        if opts.ssh_host.is_none() && now >= next_scan {
+            match discover::scan() {
+                Ok(targets) => {
+                    sync_streams(&mut streams, &targets);
+                    last_scan_error = None;
                 }
                 Err(err) => {
-                    eprintln!("smpaste: could not start ssh: {err:#}");
+                    let message = format!("{err:#}");
+                    if last_scan_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("smpaste: SSH host scan failed: {message}");
+                        last_scan_error = Some(message);
+                    }
                 }
             }
+            next_scan = now + opts.scan;
+        }
 
-            if connection.is_none() {
-                eprintln!("smpaste: retrying in {} s", RECONNECT_DELAY.as_secs());
-                thread::sleep(RECONNECT_DELAY);
-                continue;
-            }
+        // This runs even on iterations where the clipboard poll returns early.
+        for stream in &mut streams {
+            maintain_stream(stream, &opts.remote_sm, last_bmp.as_deref());
         }
 
         thread::sleep(opts.interval);
-
-        // A remote command can exit without the next write failing, so check
-        // the child explicitly on every interval.
-        let exited = match connection.as_mut() {
-            Some(conn) => match conn.try_wait() {
-                Ok(status) => status,
-                Err(err) => {
-                    eprintln!("smpaste: could not query ssh process: {err}");
-                    None
-                }
-            },
-            None => None,
-        };
-        if let Some(status) = exited {
-            eprintln!(
-                "smpaste: ssh exited ({status}); reconnecting in {} s",
-                RECONNECT_DELAY.as_secs()
-            );
-            // Dropping the connection closes stdin and reaps the child.
-            connection = None;
-            thread::sleep(RECONNECT_DELAY);
-            continue;
-        }
 
         let sequence = platform::clipboard_sequence();
         if sequence.is_some() && sequence == last_sequence {
@@ -311,24 +337,166 @@ fn run(opts: Options) -> Result<()> {
         );
         last_bmp = Some(bmp);
 
-        // Scope the mutable borrow of `connection` so we can clear it below.
-        let send_result = match (connection.as_mut(), last_bmp.as_deref()) {
-            (Some(conn), Some(bmp)) => Some(conn.send(bmp)),
-            _ => None,
+        let Some(bmp) = last_bmp.as_deref() else {
+            continue;
         };
-        match send_result {
-            Some(Ok(bytes)) => eprintln!("smpaste: sent {bytes} frame bytes"),
-            Some(Err(err)) => {
-                eprintln!(
-                    "smpaste: send failed: {err:#}; reconnecting in {} s",
-                    RECONNECT_DELAY.as_secs()
-                );
-                connection = None;
-                thread::sleep(RECONNECT_DELAY);
-                // The next iteration reconnects and replays `last_bmp`.
+        for stream in &mut streams {
+            // A failure only retires this stream; the others keep their
+            // connections.
+            let result = match stream.connection.as_mut() {
+                Some(connection) => connection.send(bmp),
+                None => continue,
+            };
+            match result {
+                Ok(bytes) => eprintln!(
+                    "smpaste[{}]: sent {bytes} frame bytes",
+                    stream.target.label()
+                ),
+                Err(err) => {
+                    eprintln!(
+                        "smpaste[{}]: send failed: {err:#}; reconnecting in {} s",
+                        stream.target.label(),
+                        stream.retry_delay.as_secs()
+                    );
+                    stream.connection = None;
+                    restart_timer(stream);
+                }
             }
-            None => {}
         }
+    }
+}
+
+/// One SSH host this process forwards clipboard images to.
+struct Stream {
+    target: SshTarget,
+    connection: Option<Connection>,
+    next_retry: Instant,
+    retry_delay: Duration,
+    /// A fixed stream comes from `--ssh-host`: it never scans or backs off.
+    fixed: bool,
+}
+
+impl Stream {
+    fn new(target: SshTarget, fixed: bool, first_attempt: Instant) -> Self {
+        Self {
+            target,
+            connection: None,
+            next_retry: first_attempt,
+            retry_delay: RECONNECT_DELAY,
+            fixed,
+        }
+    }
+}
+
+/// Reconcile the discovered streams with the latest scan result.
+fn sync_streams(streams: &mut Vec<Stream>, targets: &[SshTarget]) {
+    let mut kept = Vec::with_capacity(streams.len());
+    for stream in streams.drain(..) {
+        let still_present = stream.fixed
+            || targets
+                .iter()
+                .any(|target| target.key() == stream.target.key());
+        if still_present {
+            kept.push(stream);
+        } else {
+            eprintln!(
+                "smpaste[{}]: SSH host disappeared; closing stream",
+                stream.target.label()
+            );
+            // Dropping the stream closes stdin and kills the ssh process.
+        }
+    }
+    *streams = kept;
+
+    for target in targets {
+        let key = target.key();
+        if streams.iter().any(|stream| stream.target.key() == key) {
+            continue;
+        }
+        eprintln!("smpaste[{}]: discovered SSH host", target.label());
+        streams.push(Stream::new(target.clone(), false, Instant::now()));
+    }
+}
+
+/// Connect a stream when its retry timer is due and drop connections whose
+/// process exited.
+fn maintain_stream(stream: &mut Stream, remote_sm: &str, last_bmp: Option<&[u8]>) {
+    if stream.connection.is_some() {
+        let exit = stream
+            .connection
+            .as_mut()
+            .expect("connection checked above")
+            .try_wait();
+        match exit {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                eprintln!(
+                    "smpaste[{}]: ssh exited ({status})",
+                    stream.target.label()
+                );
+                stream.connection = None;
+                restart_timer(stream);
+            }
+            Err(err) => {
+                eprintln!(
+                    "smpaste[{}]: could not query ssh process: {err}",
+                    stream.target.label()
+                );
+                stream.connection = None;
+                restart_timer(stream);
+            }
+        }
+        return;
+    }
+
+    if Instant::now() < stream.next_retry {
+        return;
+    }
+
+    match Connection::connect(&stream.target, remote_sm) {
+        Ok(mut connection) => {
+            eprintln!("smpaste[{}]: ssh stream started", stream.target.label());
+            let replay_ok = match last_bmp {
+                Some(bmp) => match connection.send(bmp) {
+                    Ok(bytes) => {
+                        eprintln!(
+                            "smpaste[{}]: replayed last image ({bytes} frame bytes)",
+                            stream.target.label()
+                        );
+                        true
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "smpaste[{}]: replaying last image failed: {err:#}",
+                            stream.target.label()
+                        );
+                        false
+                    }
+                },
+                None => true,
+            };
+            if replay_ok {
+                stream.connection = Some(connection);
+                stream.retry_delay = RECONNECT_DELAY;
+            } else {
+                restart_timer(stream);
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "smpaste[{}]: could not start ssh: {err:#}",
+                stream.target.label()
+            );
+            restart_timer(stream);
+        }
+    }
+}
+
+/// Schedule the next attempt and grow the backoff for discovered streams.
+fn restart_timer(stream: &mut Stream) {
+    stream.next_retry = Instant::now() + stream.retry_delay;
+    if !stream.fixed {
+        stream.retry_delay = (stream.retry_delay * 2).min(MAX_RETRY_DELAY);
     }
 }
 
@@ -362,36 +530,27 @@ impl ClipboardWatcher {
     }
 }
 
-/// A persistent `ssh -T <host> <remote-sm> clipboard-image --stream` process.
+/// A persistent `ssh ... <remote-sm> clipboard-image --stream` process.
 struct Connection {
     child: Child,
     stdin: ChildStdin,
 }
 
 impl Connection {
-    fn connect(opts: &Options) -> Result<Self> {
+    fn connect(target: &SshTarget, remote_sm: &str) -> Result<Self> {
         // BatchMode keeps a missing key or passphrase from turning into an
         // interactive prompt: stdin is the image pipe, so a prompt would
         // consume the stream and hang. Compression matters because a raw BMP
-        // is large but compresses very well.
+        // is large but compresses very well. Options inherited from the
+        // original session were filtered by `discover`.
+        let args = discover::ssh_command_args(target, remote_sm);
         let mut child = Command::new("ssh")
-            .arg("-T")
-            .arg("-C")
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ServerAliveInterval=15")
-            .arg("-o")
-            .arg("ServerAliveCountMax=3")
-            .arg(&opts.ssh_host)
-            .arg(&opts.remote_sm)
-            .arg("clipboard-image")
-            .arg("--stream")
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("failed to spawn ssh for host {:?}", opts.ssh_host))?;
+            .with_context(|| format!("failed to spawn ssh for host {:?}", target.label()))?;
 
         let stdin = child
             .stdin
@@ -541,6 +700,56 @@ mod tests {
 
     fn i32_le(bytes: &[u8], offset: usize) -> i32 {
         i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli> {
+        parse_args(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn ssh_host_is_optional() {
+        let Cli::Run(opts) = parse(&[]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert_eq!(opts.ssh_host, None);
+        assert_eq!(opts.remote_sm, "sm");
+        assert_eq!(opts.interval, Duration::from_millis(200));
+        assert_eq!(opts.scan, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn scan_ms_defaults_and_validates() {
+        let Cli::Run(opts) = parse(&["--scan-ms", "250"]).unwrap() else {
+            panic!("expected run options");
+        };
+        assert_eq!(opts.scan, Duration::from_millis(250));
+
+        let err = parse(&["--scan-ms", "0"]).unwrap_err();
+        assert!(err.to_string().contains("--scan-ms"), "{err:#}");
+        assert!(parse(&["--scan-ms", "nope"]).is_err());
+    }
+
+    #[test]
+    fn explicit_host_is_used_instead_of_discovery() {
+        // Discovery is gated on `ssh_host.is_none()` in `run`, so a fixed host
+        // is all the parse-level assertion that is needed here.
+        let Cli::Run(opts) = parse(&["--ssh-host", "my-server", "--scan-ms", "1234"]).unwrap()
+        else {
+            panic!("expected run options");
+        };
+        assert_eq!(opts.ssh_host.as_deref(), Some("my-server"));
+        assert_eq!(opts.scan, Duration::from_millis(1234));
+    }
+
+    #[test]
+    fn rejects_empty_ssh_host() {
+        assert!(parse(&["--ssh-host", ""]).is_err());
+    }
+
+    #[test]
+    fn help_is_recognised() {
+        assert!(matches!(parse(&["-h"]).unwrap(), Cli::Help));
+        assert!(matches!(parse(&["--help"]).unwrap(), Cli::Help));
     }
 
     #[test]

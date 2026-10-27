@@ -100,8 +100,11 @@ whole screen.
 
 SSH carries text only, and Claude Code reads images from the clipboard of the
 machine that runs it. `smpaste` (the small client binary in `smpaste/`) closes
-that gap: it watches the local clipboard and pushes every new image to the host
-over one persistent SSH connection.
+that gap: it watches the local clipboard and pushes every new image to the
+hosts it finds over persistent SSH connections. By default it discovers the
+hosts itself by scanning the local process list for interactive `ssh`
+sessions, so you can just start it; pass `--ssh-host <alias>` to pin a single
+host instead.
 
 On the SSH client, download the artifact for your platform from the `smpaste`
 GitHub Actions run (macOS arm64/x64, Linux x64/arm64, Windows x64), or build it
@@ -109,8 +112,13 @@ yourself:
 
 ```sh
 cargo build --release -p smpaste
-smpaste --ssh-host <your-ssh-alias>
+smpaste
 ```
+
+To forward to one specific host, run
+`smpaste --ssh-host <your-ssh-alias>`; the discovery interval can be tuned with
+`--scan-ms` (default 5000 ms). Automatic discovery is available on macOS and
+Linux only; on Windows pass `--ssh-host`.
 
 The host stages the newest image in `%TEMP%\shell-manager-paste\latest.bmp`.
 
@@ -134,7 +142,8 @@ must already have delivered the image.
 
 The watcher forwards **every** clipboard image, not only the ones intended for
 the host. Run it only on a client you are comfortable sending that data from.
-Autostart examples and SSH authentication notes are in `smpaste/README.md`.
+To find SSH sessions it also reads the local process list. Autostart examples
+and SSH authentication notes are in `smpaste/README.md`.
 
 ## Web UI
 
