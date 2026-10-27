@@ -25,6 +25,14 @@ interface Attempt {
   takeover: boolean;
 }
 
+/** xterm 需要显式字体字符串；字体栈只在 tokens.css 里维护一份。 */
+function terminalFontFamily(): string {
+  const value = getComputedStyle(document.documentElement)
+    .getPropertyValue("--font-mono")
+    .trim();
+  return value || '"UbuntuMono Nerd Font", "PingFang SC", monospace';
+}
+
 const TERMINAL_THEME = {
   background: "#102023",
   foreground: "#ded8c8",
@@ -248,7 +256,7 @@ export function TerminalPane({
 
     const terminal = new Terminal({
       scrollback: 5000,
-      fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "Courier New", monospace',
+      fontFamily: terminalFontFamily(),
       fontSize: fontSize(),
       lineHeight: 1.2,
       cursorBlink: true,

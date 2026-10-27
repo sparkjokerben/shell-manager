@@ -22,7 +22,7 @@
 
 - **Bahnschrift**：字标、页面标题、会话名。Windows 自带的工业感展示字体。
 - **Segoe UI Variable / Segoe UI**：正文、控件、对话框。
-- **Cascadia Mono / Consolas**：只用于终端，不用等宽字体做装饰性小标签。
+- **UbuntuMono Nerd Font / 苹方（PingFang SC）**：只用于终端；西文与 Nerd Font 图标用前者，中文用后者，不用等宽字体做装饰性小标签。
 
 ### 布局
 
@@ -49,7 +49,7 @@
 2. **只留一个活跃信号。** 只有已附着会话显示波形；只有当前附着的会话在动，其余保持安静。
 3. **断开和销毁必须看起来不同。** 断开是安静的；停止用 Oxide，并经过确认。
 4. **终端就是产品。** 上下边框薄、信息有用，不抢终端内容。
-5. **使用 Windows 自身的材料。** Bahnschrift、Segoe UI、Cascadia/Consolas；不下载字体、不用图标库、不挂 CDN。
+5. **使用 Windows 自身的材料。** Bahnschrift、Segoe UI、UbuntuMono Nerd Font/苹方；不下载字体、不用图标库、不挂 CDN。
 
 ## 对照默认套路自检
 
