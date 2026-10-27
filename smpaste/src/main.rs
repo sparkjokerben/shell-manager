@@ -44,8 +44,8 @@ mod platform {
 
     #[cfg(target_os = "macos")]
     pub fn clipboard_sequence() -> Option<u64> {
-        let pasteboard = unsafe { objc2_app_kit::NSPasteboard::generalPasteboard() };
-        Some(unsafe { pasteboard.changeCount() } as u64)
+        let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+        Some(pasteboard.changeCount() as u64)
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
