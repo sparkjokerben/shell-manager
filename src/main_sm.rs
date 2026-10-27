@@ -1009,6 +1009,10 @@ impl DetachDetector {
             .map(|seq| partial_suffix(&self.pending, seq))
             .max()
             .unwrap_or(0);
+        // A lone ESC is the Esc key, not the first byte of a split F12. Holding
+        // it back would delay it until the next key arrives and turn "Esc, x"
+        // into Alt+x; only multi-byte partial sequences are worth waiting for.
+        let keep = if keep == 1 { 0 } else { keep };
         let split = self.pending.len() - keep;
         let forward = self.pending[..split].to_vec();
         self.pending.drain(..split);
@@ -1708,6 +1712,18 @@ mod tests {
         let (out, detach) = d.feed(b"4~");
         assert!(detach);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn lone_escape_is_forwarded_immediately() {
+        let mut d = DetachDetector::new();
+        let (out, detach) = d.feed(b"\x1b");
+        assert!(!detach);
+        assert_eq!(&out[..], b"\x1b");
+        // The next key must arrive on its own, not as Alt+<key>.
+        let (out, detach) = d.feed(b"x");
+        assert!(!detach);
+        assert_eq!(&out[..], b"x");
     }
 
     #[test]
